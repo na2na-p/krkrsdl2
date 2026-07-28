@@ -36,6 +36,14 @@
 #define TVPDSAttenuateToPan(x) x
 #define TVPDSAttenuateToVolume(x) x
 #endif
+#ifdef __ANDROID__
+#include <cstdlib>
+#include <SDL.h>
+// PL_MPEG_IMPLEMENTATION must be defined in exactly one translation unit;
+// this is that unit.
+#define PL_MPEG_IMPLEMENTATION
+#include "pl_mpeg.h"
+#endif
 
 //---------------------------------------------------------------------------
 static std::vector<tTJSNI_VideoOverlay *> TVPVideoOverlayVector;
@@ -65,6 +73,55 @@ static void TVPShutdownVideoOverlay()
 static tTVPAtExit TVPShutdownVideoOverlayAtExit
 	(TVP_ATEXIT_PRI_PREPARE, TVPShutdownVideoOverlay);
 //---------------------------------------------------------------------------
+
+#ifdef __ANDROID__
+//---------------------------------------------------------------------------
+// pl_mpeg decode callback trampolines
+//---------------------------------------------------------------------------
+// These must have the exact signature pl_mpeg expects (plm_t*, plm_frame_t*/
+// plm_samples_t*, void*), so they cannot be tTJSNI_VideoOverlay member
+// functions declared in VideoOvlImpl.h (plm_frame_t/plm_samples_t are
+// anonymous-struct typedefs and cannot be forward-declared there).
+static void TVPPlmVideoDecodeCallback(plm_t *plm, plm_frame_t *frame, void *user)
+{
+	static_cast<tTJSNI_VideoOverlay *>(user)->PlmWriteVideoFrame(frame);
+}
+//---------------------------------------------------------------------------
+static void TVPPlmAudioDecodeCallback(plm_t *plm, plm_samples_t *samples, void *user)
+{
+	static_cast<tTJSNI_VideoOverlay *>(user)->PlmQueueAudioSamples(samples);
+}
+//---------------------------------------------------------------------------
+bool TVPPlmTickAll()
+{
+	// PlmTick() may call SetStatusAsync(Stop), whose handler can synchronously
+	// Close() the overlay (removing it from TVPVideoOverlayVector). Iterate a
+	// snapshot so that erase() during the loop can never invalidate our
+	// iterator.
+	std::vector<tTJSNI_VideoOverlay*> overlays(TVPVideoOverlayVector);
+	bool anyPlaying = false;
+	tjs_uint64 now = SDL_GetTicks64();
+	for(std::vector<tTJSNI_VideoOverlay*>::iterator i = overlays.begin();
+		i != overlays.end(); i++)
+	{
+		if((*i)->PlmTick(now)) anyPlaying = true;
+	}
+	return anyPlaying;
+}
+//---------------------------------------------------------------------------
+void TVPPlmRenderAll(SDL_Renderer *renderer, const SDL_Rect &destRect,
+	int innerWidth, int innerHeight)
+{
+	// see TVPPlmTickAll() for why this iterates a snapshot
+	std::vector<tTJSNI_VideoOverlay*> overlays(TVPVideoOverlayVector);
+	for(std::vector<tTJSNI_VideoOverlay*>::iterator i = overlays.begin();
+		i != overlays.end(); i++)
+	{
+		(*i)->PlmRender(renderer, destRect, innerWidth, innerHeight);
+	}
+}
+//---------------------------------------------------------------------------
+#endif
 
 
 
@@ -103,6 +160,17 @@ tTJSNI_VideoOverlay::tTJSNI_VideoOverlay()
 #if defined(_WIN32) && defined(KRKRSDL2_USE_WIN32_EVENT_QUEUE) && defined(KRKRSDL2_ENABLE_VIDEOOVERLAY)
 	Bitmap[0] = Bitmap[1] = NULL;
 	BmpBits[0] = BmpBits[1] = NULL;
+#endif
+#ifdef __ANDROID__
+	PlmDecoder = NULL;
+	PlmTexture = NULL;
+	PlmRgbBuffer = NULL;
+	PlmAudioDevice = 0;
+	PlmPlaying = false;
+	PlmFrameDirty = false;
+	PlmLastTickMs = 0;
+	PlmVideoWidth = 0;
+	PlmVideoHeight = 0;
 #endif
 }
 //---------------------------------------------------------------------------
@@ -229,6 +297,55 @@ void tTJSNI_VideoOverlay::Open(const ttstr &_name)
 	// set Status
 	ClearWndProcMessages();
 	SetStatus(tTVPVideoOverlayStatus::Stop);
+#elif defined(__ANDROID__)
+	// first, close
+	Close();
+
+	tTJSBinaryStream *stream = TVPCreateStream(_name);
+	// plm_create_with_memory(..., 1) below hands `data` to pl_mpeg, which
+	// releases it with PLM_FREE() (plain free()) in plm_destroy(). It must
+	// therefore be malloc'd here, not `new[]`'d, or the two allocators
+	// mismatch.
+	tjs_uint8 *data = NULL;
+	tjs_uint64 size = 0;
+	try
+	{
+		size = stream->GetSize();
+		data = static_cast<tjs_uint8 *>(malloc(static_cast<size_t>(size)));
+		if(!data) TVPThrowExceptionMessage(TVPInvalidVideoSize);
+		stream->ReadBuffer(data, static_cast<tjs_uint>(size));
+	}
+	catch(...)
+	{
+		delete stream;
+		free(data);
+		throw;
+	}
+	delete stream;
+
+	plm_t *plm = plm_create_with_memory(data, static_cast<size_t>(size), 1);
+	if(!plm)
+	{
+		free(data);
+		TVPThrowExceptionMessage(TVPInvalidVideoSize);
+	}
+
+	tjs_int width = plm_get_width(plm);
+	tjs_int height = plm_get_height(plm);
+	if(width <= 0 || height <= 0)
+	{
+		plm_destroy(plm); // also frees `data`
+		TVPThrowExceptionMessage(TVPInvalidVideoSize);
+	}
+
+	PlmDecoder = plm;
+	PlmVideoWidth = width;
+	PlmVideoHeight = height;
+	PlmRgbBuffer = new tjs_uint8[static_cast<size_t>(width) * height * 3];
+
+	TVPAddVideOverlay(this);
+
+	SetStatus(tTVPVideoOverlayStatus::Stop);
 #endif
 }
 //---------------------------------------------------------------------------
@@ -254,6 +371,31 @@ void tTJSNI_VideoOverlay::Close()
 
 	Bitmap[0] = Bitmap[1] = NULL;
 	BmpBits[0] = BmpBits[1] = NULL;
+#elif defined(__ANDROID__)
+	if(PlmAudioDevice != 0)
+	{
+		SDL_CloseAudioDevice(static_cast<SDL_AudioDeviceID>(PlmAudioDevice));
+		PlmAudioDevice = 0;
+	}
+	if(PlmTexture)
+	{
+		SDL_DestroyTexture(PlmTexture);
+		PlmTexture = NULL;
+	}
+	delete [] PlmRgbBuffer;
+	PlmRgbBuffer = NULL;
+	if(PlmDecoder)
+	{
+		// also frees the buffer handed to plm_create_with_memory (free_when_done=1)
+		plm_destroy(static_cast<plm_t *>(PlmDecoder));
+		PlmDecoder = NULL;
+	}
+	PlmPlaying = false;
+	PlmFrameDirty = false;
+
+	TVPRemoveVideoOverlay(this);
+
+	SetStatus(tTVPVideoOverlayStatus::Unload);
 #endif
 }
 //---------------------------------------------------------------------------
@@ -296,6 +438,41 @@ void tTJSNI_VideoOverlay::Play()
 		ClearWndProcMessages();
 		if( Mode != vomMFEVR ) SetStatus(tTVPVideoOverlayStatus::Play);
 	}
+#elif defined(__ANDROID__)
+	if(!PlmDecoder || PlmPlaying) return;
+
+	if(PlmAudioDevice != 0)
+	{
+		// re-entering Play() after Stop(): the device is kept open (only
+		// paused) so playback can resume without reopening it
+		SDL_PauseAudioDevice(static_cast<SDL_AudioDeviceID>(PlmAudioDevice), 0);
+	}
+	else if(SDL_InitSubSystem(SDL_INIT_AUDIO) == 0)
+	{
+		SDL_AudioSpec want, have;
+		SDL_zero(want);
+		want.freq = plm_get_samplerate(static_cast<plm_t *>(PlmDecoder));
+		want.format = AUDIO_F32SYS;
+		want.channels = 2;
+		want.samples = 4096;
+		SDL_AudioDeviceID dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+		if(dev != 0)
+		{
+			PlmAudioDevice = dev;
+			// pl_mpeg docs recommend lead_time = SDL_AudioSpec.samples / samplerate
+			// for SDL2 output
+			plm_set_audio_lead_time(static_cast<plm_t *>(PlmDecoder),
+				static_cast<double>(have.samples) / static_cast<double>(have.freq));
+			SDL_PauseAudioDevice(dev, 0);
+		}
+	}
+
+	plm_set_video_decode_callback(static_cast<plm_t *>(PlmDecoder), TVPPlmVideoDecodeCallback, this);
+	plm_set_audio_decode_callback(static_cast<plm_t *>(PlmDecoder), TVPPlmAudioDecodeCallback, this);
+
+	PlmPlaying = true;
+	PlmLastTickMs = SDL_GetTicks64();
+	SetStatus(tTVPVideoOverlayStatus::Play);
 #endif
 }
 //---------------------------------------------------------------------------
@@ -309,6 +486,16 @@ void tTJSNI_VideoOverlay::Stop()
 		ClearWndProcMessages();
 		if( Mode != vomMFEVR ) SetStatus(tTVPVideoOverlayStatus::Stop);
 	}
+#elif defined(__ANDROID__)
+	if(!PlmDecoder) return;
+
+	PlmPlaying = false;
+	if(PlmAudioDevice != 0)
+	{
+		SDL_PauseAudioDevice(static_cast<SDL_AudioDeviceID>(PlmAudioDevice), 1);
+		SDL_ClearQueuedAudio(static_cast<SDL_AudioDeviceID>(PlmAudioDevice));
+	}
+	SetStatus(tTVPVideoOverlayStatus::Stop);
 #endif
 }
 //---------------------------------------------------------------------------
@@ -1381,6 +1568,79 @@ void tTJSNI_VideoOverlay::ClearWndProcMessages()
 #endif
 }
 //---------------------------------------------------------------------------
+#ifdef __ANDROID__
+bool tTJSNI_VideoOverlay::PlmTick(tjs_uint64 nowMs)
+{
+	if(!PlmPlaying || !PlmDecoder) return false;
+
+	double elapsed = static_cast<double>(nowMs - PlmLastTickMs) / 1000.0;
+	// Clamp the step so that a stall (e.g. the app was backgrounded) does not
+	// make plm_decode() try to catch up by decoding many seconds of frames
+	// in a single call.
+	if(elapsed > 0.25) elapsed = 0.25;
+	if(elapsed < 0.0) elapsed = 0.0;
+	PlmLastTickMs = nowMs;
+
+	plm_decode(static_cast<plm_t *>(PlmDecoder), elapsed);
+
+	if(plm_has_ended(static_cast<plm_t *>(PlmDecoder)))
+	{
+		PlmPlaying = false;
+		if(PlmAudioDevice != 0)
+			SDL_PauseAudioDevice(static_cast<SDL_AudioDeviceID>(PlmAudioDevice), 1);
+		SetStatusAsync(tTVPVideoOverlayStatus::Stop);
+		return false;
+	}
+	return true;
+}
+//---------------------------------------------------------------------------
+void tTJSNI_VideoOverlay::PlmRender(SDL_Renderer *renderer, const SDL_Rect &destRect,
+	int innerWidth, int innerHeight)
+{
+	if(!PlmDecoder || !PlmPlaying || !Visible) return;
+	if(innerWidth <= 0 || innerHeight <= 0) return;
+	if(PlmVideoWidth <= 0 || PlmVideoHeight <= 0) return;
+
+	if(!PlmTexture)
+	{
+		PlmTexture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB24,
+			SDL_TEXTUREACCESS_STREAMING, PlmVideoWidth, PlmVideoHeight);
+		if(!PlmTexture) return;
+	}
+
+	if(PlmFrameDirty)
+	{
+		SDL_UpdateTexture(PlmTexture, NULL, PlmRgbBuffer, PlmVideoWidth * 3);
+		PlmFrameDirty = false;
+	}
+
+	// Map the overlay's game-resolution Rect into screen coordinates using
+	// the same destRect/innerWidth/innerHeight transform TickBeat applies to
+	// the main game texture, so the video lines up with the layer beneath it.
+	SDL_Rect dst;
+	dst.x = destRect.x + Rect.left * destRect.w / innerWidth;
+	dst.y = destRect.y + Rect.top * destRect.h / innerHeight;
+	dst.w = Rect.get_width() * destRect.w / innerWidth;
+	dst.h = Rect.get_height() * destRect.h / innerHeight;
+
+	SDL_RenderCopy(renderer, PlmTexture, NULL, &dst);
+}
+//---------------------------------------------------------------------------
+void tTJSNI_VideoOverlay::PlmWriteVideoFrame(void *frame)
+{
+	plm_frame_to_rgb(static_cast<plm_frame_t *>(frame), PlmRgbBuffer, PlmVideoWidth * 3);
+	PlmFrameDirty = true;
+}
+//---------------------------------------------------------------------------
+void tTJSNI_VideoOverlay::PlmQueueAudioSamples(void *samples)
+{
+	if(PlmAudioDevice == 0) return;
+	plm_samples_t *s = static_cast<plm_samples_t *>(samples);
+	SDL_QueueAudio(static_cast<SDL_AudioDeviceID>(PlmAudioDevice), s->interleaved,
+		s->count * 2 * sizeof(float));
+}
+//---------------------------------------------------------------------------
+#endif
 
 
 

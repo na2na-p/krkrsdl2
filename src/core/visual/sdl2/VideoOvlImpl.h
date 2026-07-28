@@ -22,6 +22,16 @@
 
 #include "NativeEventQueue.h"
 
+#ifdef __ANDROID__
+// Forward declarations only: pl_mpeg.h is included solely by VideoOvlImpl.cpp
+// (the only translation unit that needs the decoder), and SDL.h is kept out
+// of this header to avoid pulling it into every file that includes
+// VideoOvlIntf.h.
+struct SDL_Renderer;
+struct SDL_Texture;
+struct SDL_Rect;
+#endif
+
 //---------------------------------------------------------------------------
 // tTJSNI_VideoOverlay : VideoOverlay Native Instance
 //---------------------------------------------------------------------------
@@ -62,6 +72,21 @@ class tTJSNI_VideoOverlay : public tTJSNI_BaseVideoOverlay
 	//! イベントが設定されているフレームより前に現在フレームが移動した時、このフラグは解除される。
 	bool	IsEventPast;
 	int		EventFrame;		//!< イベントを発生させるフレーム
+
+#ifdef __ANDROID__
+	// PlmDecoderに渡したファイル全体のバッファはplm_create_with_memoryへ
+	// free_when_done=1で渡しており、plm_destroy()が解放するためこのクラスでは
+	// ポインタを保持しない
+	void *PlmDecoder;			//!< plm_t*。このヘッダをpl_mpeg.h非依存に保つためvoid*で保持
+	SDL_Texture *PlmTexture;	//!< 描画用テクスチャ。初回描画時に遅延生成
+	tjs_uint8 *PlmRgbBuffer;
+	unsigned int PlmAudioDevice;	//!< SDL_AudioDeviceID（SDL2ではUint32のtypedef）
+	bool PlmPlaying;
+	bool PlmFrameDirty;
+	tjs_uint64 PlmLastTickMs;
+	tjs_int PlmVideoWidth;
+	tjs_int PlmVideoHeight;
+#endif
 
 public:
 	tTJSNI_VideoOverlay();
@@ -194,6 +219,25 @@ public:
 	void SetRectOffset(tjs_int ofsx, tjs_int ofsy);
 	void DetachVideoOverlay();
 
+#ifdef __ANDROID__
+public:
+	//! @brief 前回呼び出しからの経過時間分デコードを進める
+	//! @return 再生継続中ならtrue（呼び出し側が画面再描画要否を判断するために使う）
+	bool PlmTick(tjs_uint64 nowMs);
+	//! @brief 現在のデコード済みフレームを描画する
+	//! destRect/innerWidth/innerHeightはTickBeatがゲーム画面テクスチャに使うものと
+	//! 同じ変換元で、ゲーム解像度で保持しているRectを画面座標へ写像するために使う
+	void PlmRender(SDL_Renderer *renderer, const SDL_Rect &destRect, int innerWidth, int innerHeight);
+
+	//! @brief pl_mpegの動画デコードコールバック（VideoOvlImpl.cpp内のファイルスコープの
+	//! トランポリン関数）から呼ばれる。frameは実際にはplm_frame_t*だが、pl_mpeg.h内で
+	//! 無名structとしてtypedefされ前方宣言できないためvoid*で受ける
+	void PlmWriteVideoFrame(void *frame);
+	//! @brief pl_mpegの音声デコードコールバックから呼ばれる。samplesは実際には
+	//! plm_samples_t*（理由はPlmWriteVideoFrameと同じ）
+	void PlmQueueAudioSamples(void *samples);
+#endif
+
 private:
 	void WndProc( NativeEvent& ev );
 		// UtilWindow's window procedure
@@ -201,5 +245,15 @@ private:
 
 };
 //---------------------------------------------------------------------------
+
+#ifdef __ANDROID__
+//! @brief 再生中の全VideoOverlayインスタンスのデコードを1ティック進める
+//! @return いずれかが再生中ならtrue。呼び出し側(TickBeat)はこれをneedsGraphicUpdateの
+//! 判断材料にする
+extern bool TVPPlmTickAll();
+//! @brief 再生中かつvisibleな全VideoOverlayインスタンスを描画する
+extern void TVPPlmRenderAll(SDL_Renderer *renderer, const SDL_Rect &destRect,
+	int innerWidth, int innerHeight);
+#endif
 
 #endif
