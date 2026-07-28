@@ -45,6 +45,10 @@
 #include "tjsArray.h"
 #include "EventIntf.h"
 
+#ifdef __ANDROID__
+#include <jni.h>
+#endif
+
 //---------------------------------------------------------------------------
 #ifdef KRKRZ_ENABLE_CANVAS
 // The following is defined in OpenGLPlatformSDL2.cpp
@@ -115,10 +119,93 @@ static tjs_int TVPShowYesNoMessageBox(const ttstr & text, const ttstr & caption)
 	return (tjs_int)hit;
 }
 //---------------------------------------------------------------------------
-// SDL_ShowMessageBox renders each item as a full-width tappable button;
-// a phone screen cannot usefully host more than a handful, so long lists
-// are trimmed to this count instead of rejecting the call outright.
+// Bounds the SDL_ShowMessageBox fallback path (non-Android, and Android
+// builds whose Activity doesn't carry showSelectList): it renders each item
+// as a full-width tappable button, and a phone screen cannot usefully host
+// more than a handful, so long lists are trimmed to this count instead of
+// rejecting the call outright. The Android-native list dialog scrolls and
+// has no such limit, but shares this cap for simplicity -- KAG menus are
+// not expected to routinely exceed it anyway.
 static constexpr int TVPSelectListMaxItems = 16;
+//---------------------------------------------------------------------------
+#ifdef __ANDROID__
+// TVPShowSelectListViaJNI
+//---------------------------------------------------------------------------
+// Verified on-device: SDLActivity's own messagebox (SDLActivity.java,
+// messageboxCreateAndShow) lays buttons out in a single non-scrolling
+// horizontal LinearLayout and hard-codes setCancelable(false). A handful of
+// items already pushes the cancel button off-screen and unreachable, and
+// there is no way to back out without picking one -- unusable as a menu.
+// Call the Android-native, scrollable, cancelable list dialog added to
+// KirikiriSDL2Activity instead, falling back to SDL_ShowMessageBox (the
+// caller does this) only if that method can't be resolved, e.g. a project
+// that swapped in its own Activity subclass without carrying it over.
+static bool TVPShowSelectListViaJNI(const std::string & title_utf8,
+	const std::string item_utf8[], tjs_int count, tjs_int & result)
+{
+	JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+	if (!env) return false;
+
+	// SDL_AndroidGetActivity() calls CallStaticObjectMethod internally and
+	// hands back a fresh local ref each time (see SDL_android.c); this
+	// thread stays attached for the process lifetime rather than returning
+	// to the JVM between calls, so the ref must be deleted explicitly or it
+	// never gets reclaimed.
+	jobject activity = (jobject)SDL_AndroidGetActivity();
+	if (!activity) return false;
+
+	jclass activityClass = env->GetObjectClass(activity);
+	env->DeleteLocalRef(activity);
+	if (!activityClass) return false;
+
+	bool ok = false;
+
+	jmethodID mid = env->GetStaticMethodID(activityClass, "showSelectList",
+		"(Ljava/lang/String;[Ljava/lang/String;)I");
+	if (env->ExceptionCheck())
+	{
+		env->ExceptionClear();
+		mid = nullptr;
+	}
+
+	if (mid)
+	{
+		// NewStringUTF takes modified UTF-8; TVPUtf16ToUtf8 already produced
+		// standard UTF-8, which differs from modified UTF-8 only for
+		// supplementary-plane characters and embedded NULs -- neither
+		// realistically appears in KAG menu captions/labels, so decoding
+		// back to UTF-16 and using env->NewString() would only guard
+		// against input this dialog does not actually receive.
+		jstring jtitle = env->NewStringUTF(title_utf8.c_str());
+		jclass stringClass = env->FindClass("java/lang/String");
+		jobjectArray jitems = env->NewObjectArray((jsize)count, stringClass, nullptr);
+		env->DeleteLocalRef(stringClass);
+		for (tjs_int i = 0; i < count; i++)
+		{
+			jstring jitem = env->NewStringUTF(item_utf8[i].c_str());
+			env->SetObjectArrayElement(jitems, i, jitem);
+			env->DeleteLocalRef(jitem);
+		}
+
+		jint hit = env->CallStaticIntMethod(activityClass, mid, jtitle, jitems);
+		if (env->ExceptionCheck())
+		{
+			env->ExceptionClear();
+		}
+		else
+		{
+			result = (tjs_int)hit;
+			ok = true;
+		}
+
+		env->DeleteLocalRef(jtitle);
+		env->DeleteLocalRef(jitems);
+	}
+
+	env->DeleteLocalRef(activityClass);
+	return ok;
+}
+#endif
 //---------------------------------------------------------------------------
 // TVPShowSelectList
 //---------------------------------------------------------------------------
@@ -153,6 +240,15 @@ static tjs_int TVPShowSelectList(const ttstr & caption, iTJSDispatch2 * items)
 		tjs_string s_utf16 = s.AsStdString();
 		if (!TVPUtf16ToUtf8(item_utf8[i], s_utf16)) return -1;
 	}
+
+#ifdef __ANDROID__
+	tjs_int jni_result = -1;
+	if (TVPShowSelectListViaJNI(c_utf8, item_utf8, count, jni_result))
+	{
+		return jni_result;
+	}
+	// fall through to the SDL_ShowMessageBox path below on JNI failure
+#endif
 
 	SDL_MessageBoxButtonData buttons[TVPSelectListMaxItems + 1];
 	for (tjs_int i = 0; i < count; i++)
