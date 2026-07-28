@@ -768,6 +768,12 @@ TVPWindowWindow::TVPWindowWindow(tTJSNI_Window *w)
 #ifdef SDL_HINT_TOUCH_MOUSE_EVENTS
 	SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "1");
 #endif
+#if defined(__ANDROID__) && defined(SDL_HINT_ANDROID_TRAP_BACK_BUTTON)
+	// Trap the back button so it reaches the event loop as SDLK_AC_BACK
+	// instead of finishing the activity; it is translated to a right
+	// click there to open the KAG right-click (save/load) menu.
+	SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
+#endif
 #ifdef SDL_HINT_MOUSE_TOUCH_EVENTS
 	SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
 #endif
@@ -2771,6 +2777,22 @@ bool TVPWindowWindow::window_receive_event_input(SDL_Event event)
 					{
 						s |= TVP_SS_REPEAT;
 					}
+#if defined(__ANDROID__)
+					// Touch devices have no physical right button, which
+					// makes the KAG right-click menu (save/load) unreachable.
+					// Translate the Android back button into a right click at
+					// the last touch position.
+					if (event.key.keysym.sym == SDLK_AC_BACK)
+					{
+						if (!event.key.repeat)
+						{
+							TVPPostInputEvent(new tTVPOnMouseDownInputEvent(this->TJSNativeInstance, this->lastMouseX, this->lastMouseY, tTVPMouseButton::mbRight, s));
+							TVPPostInputEvent(new tTVPOnMouseUpInputEvent(this->TJSNativeInstance, this->lastMouseX, this->lastMouseY, tTVPMouseButton::mbRight, s));
+							TVPPostInputEvent(new tTVPOnClickInputEvent(this->TJSNativeInstance, this->lastMouseX, this->lastMouseY));
+						}
+						return true;
+					}
+#endif
 					tjs_uint unified_vk_key = 0;
 					switch (event.key.keysym.sym)
 					{
@@ -2804,6 +2826,12 @@ bool TVPWindowWindow::window_receive_event_input(SDL_Event event)
 							return false;
 						}
 					}
+#if defined(__ANDROID__)
+					if (event.key.keysym.sym == SDLK_AC_BACK)
+					{
+						return true;
+					}
+#endif
 					tjs_uint unified_vk_key = 0;
 					switch (event.key.keysym.sym)
 					{
