@@ -538,6 +538,13 @@ protected:
 	// re-cleared after the ctor's clear() in SDLBitmapCompletion.cpp:10 --
 	// so this is not about a partial-rect misalignment.)
 	bool needsVideoPresent = false;
+	// Tracks whether the in-progress press started inside the menu bar, so
+	// DOWN/UP consumption stays paired: a press that started on the bar
+	// must not fall through to the game on release just because the
+	// finger drifted off the (thin) bar rect before lifting, and a press
+	// that started on the game must not be reinterpreted as a bar tap if
+	// it happens to end up over the bar.
+	bool menuBarPressStarted = false;
 #endif
 	bool isBeingDeleted = false;
 	bool cursorTemporaryHidden = false;
@@ -737,6 +744,14 @@ public:
 	bool should_try_parent_window(SDL_Event event);
 	void window_receive_event(SDL_Event event);
 	bool window_receive_event_input(SDL_Event event);
+#ifdef __ANDROID__
+	// tap bar shown in the game's letterbox band; geometry is shared
+	// between TickBeat() (draw) and window_receive_event_input() (hit test)
+	// so the two never drift apart
+	bool GetMenuBarRect(SDL_Rect &out) const;
+	void DrawMenuBar(const SDL_Rect &bar) const;
+	static void RequestMenuBarRedrawAll();
+#endif
 };
 
 TVPWindowWindow::TVPWindowWindow(tTJSNI_Window *w)
@@ -1717,6 +1732,103 @@ void TVPWindowWindow::Swap()
 void TVPWindowWindow::Show()
 {
 }
+#ifdef __ANDROID__
+bool TVPWindowWindow::GetMenuBarRect(SDL_Rect &out) const
+{
+	if (!this->renderer) return false;
+	int output_w = 0, output_h = 0;
+	SDL_GetRendererOutputSize(this->renderer, &output_w, &output_h);
+	if (output_w <= 0 || output_h <= 0) return false;
+
+	// Thickness follows the letterbox band so the bar never overlaps the
+	// rendered game frame, but is capped at 5% of the screen (floor 32px)
+	// so it stays usable when the game fills the screen with no bars.
+	auto cap = [](int screen_dim) {
+		int c = screen_dim * 5 / 100;
+		return c < 32 ? 32 : c;
+	};
+
+	tjs_int destTop = this->LastSentDrawDeviceDestRect.top;
+	tjs_int destLeft = this->LastSentDrawDeviceDestRect.left;
+
+	if (destTop > 0)
+	{
+		// Portrait letterbox (top/bottom black bars): bar sits at the screen top.
+		int h = cap(output_h);
+		if (destTop < h) h = destTop;
+		out.x = 0;
+		out.y = 0;
+		out.w = output_w;
+		out.h = h;
+	}
+	else if (destLeft > 0)
+	{
+		// Landscape letterbox (left/right black bars): bar sits at the screen right edge.
+		int w = cap(output_w);
+		if (destLeft < w) w = destLeft;
+		out.x = output_w - w;
+		out.y = 0;
+		out.w = w;
+		out.h = output_h;
+	}
+	else
+	{
+		// No letterbox: fall back to overlaying the screen top.
+		out.x = 0;
+		out.y = 0;
+		out.w = output_w;
+		out.h = cap(output_h);
+	}
+	return true;
+}
+void TVPWindowWindow::DrawMenuBar(const SDL_Rect &bar) const
+{
+	Uint8 pr, pg, pb, pa;
+	SDL_GetRenderDrawColor(this->renderer, &pr, &pg, &pb, &pa);
+
+	SDL_SetRenderDrawColor(this->renderer, 0x1E, 0x1E, 0x1E, 0xFF);
+	SDL_RenderFillRect(this->renderer, &bar);
+
+	// Hamburger icon (3 stacked bars). Computing the offset from the bar's
+	// short axis and applying it to both x and y works for both
+	// orientations without branching: it centers the icon on the short
+	// axis and keeps it near the bar's leading edge on the long axis.
+	int shortSide = bar.w < bar.h ? bar.w : bar.h;
+	int iconSize = shortSide * 3 / 5;
+	if (iconSize < 12) iconSize = shortSide < 12 ? shortSide : 12;
+	if (iconSize > shortSide) iconSize = shortSide;
+	int margin = (shortSide - iconSize) / 2;
+
+	int lineThickness = iconSize / 6;
+	if (lineThickness < 2) lineThickness = 2;
+	int gap = (iconSize - lineThickness * 3) / 2;
+	if (gap < 1) gap = 1;
+
+	SDL_SetRenderDrawColor(this->renderer, 0xC8, 0xC8, 0xC8, 0xFF);
+	for (int i = 0; i < 3; i++)
+	{
+		SDL_Rect line;
+		line.x = bar.x + margin;
+		line.y = bar.y + margin + i * (lineThickness + gap);
+		line.w = iconSize;
+		line.h = lineThickness;
+		SDL_RenderFillRect(this->renderer, &line);
+	}
+
+	SDL_SetRenderDrawColor(this->renderer, pr, pg, pb, pa);
+}
+void TVPWindowWindow::RequestMenuBarRedrawAll()
+{
+	for (TVPWindowWindow *w = _lastWindowWindow; w; w = w->_prevWindow)
+	{
+		w->needsGraphicUpdate = true;
+	}
+}
+void TVPRequestMenuBarRedraw()
+{
+	TVPWindowWindow::RequestMenuBarRedrawAll();
+}
+#endif
 void TVPWindowWindow::TickBeat()
 {
 #ifdef __ANDROID__
@@ -1796,6 +1908,14 @@ void TVPWindowWindow::TickBeat()
 					SDL_RenderCopy(this->renderer, this->texture, &srcrect, &destrect);
 #ifdef __ANDROID__
 					TVPPlmRenderAll(this->renderer, destrect, this->GetInnerWidth(), this->GetInnerHeight());
+					if (TVPIsMenuBarCallbackRegistered())
+					{
+						SDL_Rect barRect;
+						if (this->GetMenuBarRect(barRect))
+						{
+							this->DrawMenuBar(barRect);
+						}
+					}
 #endif
 #elif defined(KRKRSDL2_RENDERER_FULL_UPDATES)
 					SDL_RenderCopy(this->renderer, this->texture, nullptr, nullptr);
@@ -2724,6 +2844,45 @@ bool TVPWindowWindow::window_receive_event_input(SDL_Event event)
 				case SDL_MOUSEBUTTONDOWN:
 				case SDL_MOUSEBUTTONUP:
 				{
+#ifdef __ANDROID__
+					if (event.type == SDL_MOUSEBUTTONUP && this->menuBarPressStarted)
+					{
+						// The matching DOWN was consumed by the bar: consume this
+						// UP unconditionally so the game never sees a dangling
+						// onMouseUp/onClick for a press it never received the
+						// onMouseDown for (finger can drift off the thin bar
+						// rect before release). Still gate the callback firing
+						// on the release position, letting a drag-off cancel it.
+						this->menuBarPressStarted = false;
+						SDL_Rect barRect;
+						if (this->GetMenuBarRect(barRect))
+						{
+							SDL_Point p{ event.button.x, event.button.y };
+							if (SDL_PointInRect(&p, &barRect))
+							{
+								TVPPostMenuBarTapEvent();
+							}
+						}
+						return true;
+					}
+					if (event.type == SDL_MOUSEBUTTONDOWN && TVPIsMenuBarCallbackRegistered())
+					{
+						SDL_Rect barRect;
+						if (this->GetMenuBarRect(barRect))
+						{
+							// event.button.x/y are raw window-pixel coordinates
+							// (same space as barRect); do not run them through
+							// TranslateWindowToDrawArea, which maps into game
+							// inner-resolution coordinates instead.
+							SDL_Point p{ event.button.x, event.button.y };
+							if (SDL_PointInRect(&p, &barRect))
+							{
+								this->menuBarPressStarted = true;
+								return true;
+							}
+						}
+					}
+#endif
 					if (SDL_IsTextInputActive() && this->imeCompositionStr)
 					{
 						return false;
