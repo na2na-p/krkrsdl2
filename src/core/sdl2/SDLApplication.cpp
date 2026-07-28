@@ -525,6 +525,20 @@ protected:
 	bool isVisible = true;
 	bool visibilityHasInitialized = false;
 	bool needsGraphicUpdate = false;
+#ifdef __ANDROID__
+	// Set instead of needsGraphicUpdate when only the video overlay advanced
+	// a frame (see TickBeat()): update_rect only ever grows and is clamped
+	// to the surface size, so it reaches full-screen within the first few
+	// draws -- re-uploading it via SDL_UpdateTexture on every video tick,
+	// even when the surface had not changed since the last real draw, was
+	// pure wasted CPU/bandwidth/battery.
+	// (update_rect is always anchored at (0,0): do_union only extends the
+	// bounds, never moves the origin -- see
+	// external/krkrz/visual/ComplexRect.h:124-132 -- and it is never
+	// re-cleared after the ctor's clear() in SDLBitmapCompletion.cpp:10 --
+	// so this is not about a partial-rect misalignment.)
+	bool needsVideoPresent = false;
+#endif
 	bool isBeingDeleted = false;
 	bool cursorTemporaryHidden = false;
 	char *imeCompositionStr;
@@ -1708,7 +1722,13 @@ void TVPWindowWindow::TickBeat()
 #ifdef __ANDROID__
 	if (TVPPlmTickAll())
 	{
-		this->needsGraphicUpdate = true;
+		// Not needsGraphicUpdate: that would make the SDL_UpdateTexture call
+		// below re-upload bitmapCompletion->update_rect (which reaches
+		// full-screen size within the first few draws) on every video
+		// frame, even though nothing in that rect actually changed --
+		// wasted CPU/bandwidth/battery this avoids. A video-only tick only
+		// needs the composite (clear + game texture + video) re-presented.
+		this->needsVideoPresent = true;
 	}
 #endif
 	if (!this->visibilityHasInitialized)
@@ -1716,7 +1736,11 @@ void TVPWindowWindow::TickBeat()
 		this->visibilityHasInitialized = true;
 		this->SetVisible(this->isVisible);
 	}
+#ifdef __ANDROID__
+	if (this->needsGraphicUpdate || this->needsVideoPresent)
+#else
 	if (this->needsGraphicUpdate)
+#endif
 	{
 		if (this->bitmapCompletion)
 		{
@@ -1742,7 +1766,11 @@ void TVPWindowWindow::TickBeat()
 #endif
 				if (this->texture)
 				{
+#ifdef __ANDROID__
+					if (this->surface && this->needsGraphicUpdate)
+#else
 					if (this->surface)
+#endif
 					{
 						if ((rect.w + rect.x) > this->surface->w)
 						{
@@ -1797,6 +1825,9 @@ void TVPWindowWindow::TickBeat()
 				this->hasDrawn = true;
 			}
 			this->needsGraphicUpdate = false;
+#ifdef __ANDROID__
+			this->needsVideoPresent = false;
+#endif
 		}
 	}
 #ifdef KRKRZ_ENABLE_CANVAS
