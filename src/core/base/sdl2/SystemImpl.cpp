@@ -191,6 +191,10 @@ static tTJSVariantClosure TVPMenuBarCallback(nullptr, nullptr);
 
 static void TVPSetMenuBarCallback(tTJSVariant * arg)
 {
+	// Registration itself is cross-platform (matches the showYesNoMessageBox
+	// precedent), but on non-Android platforms nothing ever draws the bar or
+	// fires the closure -- SDLApplication.cpp only wires up the draw/tap
+	// paths under __ANDROID__.
 	if (TVPMenuBarCallback.Object)
 	{
 		TVPMenuBarCallback.Release();
@@ -199,10 +203,14 @@ static void TVPSetMenuBarCallback(tTJSVariant * arg)
 	if (arg->Type() == tvtObject)
 	{
 		TVPMenuBarCallback = arg->AsObjectClosure(); // AddRef'd by AsObjectClosure
-#ifdef __ANDROID__
-		TVPRequestMenuBarRedraw();
-#endif
 	}
+#ifdef __ANDROID__
+	// Outside the tvtObject branch on purpose: clearing the callback (void/
+	// null) must also force a redraw, or the bar stays on screen -- with no
+	// tap handler behind it -- until an unrelated screen update happens to
+	// occur (TickBeat only redraws on needsGraphicUpdate/needsVideoPresent).
+	TVPRequestMenuBarRedraw();
+#endif
 }
 //---------------------------------------------------------------------------
 #ifdef __ANDROID__
@@ -214,7 +222,23 @@ bool TVPIsMenuBarCallbackRegistered()
 static void TVPInvokeMenuBarCallback()
 {
 	if (!TVPMenuBarCallback.Object) return;
-	TVPMenuBarCallback.FuncCall(0, NULL, NULL, NULL, 0, NULL, NULL);
+	// Take our own reference before calling out: if the callback itself
+	// calls System.setMenuBarCallback(...) and releases the global's only
+	// reference, FuncCall would otherwise be running on an object deleted
+	// out from under the current frame (re-entrant Release on the closure
+	// we're still executing).
+	tTJSVariantClosure clo = TVPMenuBarCallback;
+	clo.AddRef();
+	try
+	{
+		clo.FuncCall(0, NULL, NULL, NULL, 0, NULL, NULL);
+	}
+	catch(...)
+	{
+		clo.Release();
+		throw;
+	}
+	clo.Release();
 }
 //---------------------------------------------------------------------------
 class tTVPOnMenuBarTapInputEvent : public tTVPBaseInputEvent
