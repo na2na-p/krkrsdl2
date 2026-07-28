@@ -96,8 +96,8 @@ static tjs_int TVPShowYesNoMessageBox(const ttstr & text, const ttstr & caption)
 		return 0;
 	}
 	const SDL_MessageBoxButtonData buttons[] = {
-		{ SDL_MESSAGEBOX_BUTTON_ESCAPE_KEY_DEFAULT, 0, "いいえ" },
-		{ SDL_MESSAGEBOX_BUTTON_RETURN_KEY_DEFAULT, 1, "はい" },
+		{ SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "いいえ" },
+		{ SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "はい" },
 	};
 	SDL_MessageBoxData data = {};
 	data.flags = SDL_MESSAGEBOX_INFORMATION;
