@@ -43,6 +43,7 @@
 #endif
 #include "ScriptMgnIntf.h"
 #include "tjsArray.h"
+#include "EventIntf.h"
 
 //---------------------------------------------------------------------------
 #ifdef KRKRZ_ENABLE_CANVAS
@@ -113,6 +114,150 @@ static tjs_int TVPShowYesNoMessageBox(const ttstr & text, const ttstr & caption)
 	}
 	return (tjs_int)hit;
 }
+//---------------------------------------------------------------------------
+// SDL_ShowMessageBox renders each item as a full-width tappable button;
+// a phone screen cannot usefully host more than a handful, so long lists
+// are trimmed to this count instead of rejecting the call outright.
+static constexpr int TVPSelectListMaxItems = 16;
+//---------------------------------------------------------------------------
+// TVPShowSelectList
+//---------------------------------------------------------------------------
+static tjs_int TVPShowSelectList(const ttstr & caption, iTJSDispatch2 * items)
+{
+	// modal list selection dialog for single-window platforms (e.g. Android)
+	// that cannot host a KAG menu tree as a native window menu bar; the TJS
+	// side supplies the menu contents as a plain string array.
+	if (!items) return -1;
+
+	tTJSArrayNI *ni = nullptr;
+	if (TJS_FAILED(items->NativeInstanceSupport(TJS_NIS_GETINSTANCE,
+		TJSGetArrayClassID(), (iTJSNativeInstance**)&ni)) || !ni)
+	{
+		return -1;
+	}
+
+	tjs_int count = (tjs_int)ni->Items.size();
+	if (count <= 0) return -1;
+	if (count > TVPSelectListMaxItems) count = TVPSelectListMaxItems;
+
+	std::string c_utf8;
+	{
+		tjs_string c_utf16 = caption.AsStdString();
+		if (!TVPUtf16ToUtf8(c_utf8, c_utf16)) return -1;
+	}
+
+	std::string item_utf8[TVPSelectListMaxItems];
+	for (tjs_int i = 0; i < count; i++)
+	{
+		ttstr s = ni->Items[i];
+		tjs_string s_utf16 = s.AsStdString();
+		if (!TVPUtf16ToUtf8(item_utf8[i], s_utf16)) return -1;
+	}
+
+	SDL_MessageBoxButtonData buttons[TVPSelectListMaxItems + 1];
+	for (tjs_int i = 0; i < count; i++)
+	{
+		buttons[i].flags = 0;
+		buttons[i].buttonid = i;
+		buttons[i].text = item_utf8[i].c_str();
+	}
+	buttons[count].flags = SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT;
+	buttons[count].buttonid = -1;
+	buttons[count].text = "キャンセル";
+
+	SDL_MessageBoxData data = {};
+	data.flags = SDL_MESSAGEBOX_INFORMATION;
+	data.window = nullptr;
+	data.title = c_utf8.c_str();
+	data.message = "";
+	data.numbuttons = count + 1;
+	data.buttons = buttons;
+
+	int hit = -1;
+	if (SDL_ShowMessageBox(&data, &hit) != 0) return -1;
+	return (tjs_int)hit;
+}
+//---------------------------------------------------------------------------
+
+
+
+//---------------------------------------------------------------------------
+// System.setMenuBarCallback related
+//---------------------------------------------------------------------------
+// Default-constructed tTJSVariantClosure leaves Object/ObjThis
+// uninitialized (its ctor "does nothing" -- see tjsVariant.h); initialize
+// explicitly rather than relying on static zero-initialization semantics.
+static tTJSVariantClosure TVPMenuBarCallback(nullptr, nullptr);
+
+static void TVPSetMenuBarCallback(tTJSVariant * arg)
+{
+	// Registration itself is cross-platform (matches the showYesNoMessageBox
+	// precedent), but on non-Android platforms nothing ever draws the bar or
+	// fires the closure -- SDLApplication.cpp only wires up the draw/tap
+	// paths under __ANDROID__.
+	if (TVPMenuBarCallback.Object)
+	{
+		TVPMenuBarCallback.Release();
+		TVPMenuBarCallback.Object = TVPMenuBarCallback.ObjThis = nullptr;
+	}
+	if (arg->Type() == tvtObject)
+	{
+		TVPMenuBarCallback = arg->AsObjectClosure(); // AddRef'd by AsObjectClosure
+	}
+#ifdef __ANDROID__
+	// Outside the tvtObject branch on purpose: clearing the callback (void/
+	// null) must also force a redraw, or the bar stays on screen -- with no
+	// tap handler behind it -- until an unrelated screen update happens to
+	// occur (TickBeat only redraws on needsGraphicUpdate/needsVideoPresent).
+	TVPRequestMenuBarRedraw();
+#endif
+}
+//---------------------------------------------------------------------------
+#ifdef __ANDROID__
+bool TVPIsMenuBarCallbackRegistered()
+{
+	return TVPMenuBarCallback.Object != nullptr;
+}
+//---------------------------------------------------------------------------
+static void TVPInvokeMenuBarCallback()
+{
+	if (!TVPMenuBarCallback.Object) return;
+	// Take our own reference before calling out: if the callback itself
+	// calls System.setMenuBarCallback(...) and releases the global's only
+	// reference, FuncCall would otherwise be running on an object deleted
+	// out from under the current frame (re-entrant Release on the closure
+	// we're still executing).
+	tTJSVariantClosure clo = TVPMenuBarCallback;
+	clo.AddRef();
+	try
+	{
+		clo.FuncCall(0, NULL, NULL, NULL, 0, NULL, NULL);
+	}
+	catch(...)
+	{
+		clo.Release();
+		throw;
+	}
+	clo.Release();
+}
+//---------------------------------------------------------------------------
+class tTVPOnMenuBarTapInputEvent : public tTVPBaseInputEvent
+{
+	static tTVPUniqueTagForInputEvent Tag;
+public:
+	tTVPOnMenuBarTapInputEvent() : tTVPBaseInputEvent(Application, Tag) {};
+	void Deliver() const { TVPInvokeMenuBarCallback(); }
+};
+tTVPUniqueTagForInputEvent tTVPOnMenuBarTapInputEvent::Tag;
+//---------------------------------------------------------------------------
+void TVPPostMenuBarTapEvent()
+{
+	// posted (never invoked synchronously from the input handler) so the
+	// callback runs outside of SDL event processing, matching how other
+	// input events reach TJS
+	TVPPostInputEvent(new tTVPOnMenuBarTapInputEvent(), TVP_EPT_REMOVE_POST);
+}
+#endif
 //---------------------------------------------------------------------------
 
 
@@ -949,6 +1094,41 @@ TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/showYesNoMessageBox)
 }
 TJS_END_NATIVE_STATIC_METHOD_DECL_OUTER(/*object to register*/cls,
 	/*func. name*/showYesNoMessageBox)
+//----------------------------------------------------------------------
+TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/showSelectList)
+{
+	// modal list selection dialog; returns the tapped 0-based index, -1 when cancelled
+	if(numparams < 2) return TJS_E_BADPARAMCOUNT;
+
+	ttstr caption = *param[0];
+
+	iTJSDispatch2 *items = nullptr;
+	if(param[1]->Type() == tvtObject)
+		items = param[1]->AsObjectNoAddRef();
+
+	tjs_int hit = TVPShowSelectList(caption, items);
+
+	if(result) *result = hit;
+
+	return TJS_S_OK;
+}
+TJS_END_NATIVE_STATIC_METHOD_DECL_OUTER(/*object to register*/cls,
+	/*func. name*/showSelectList)
+//----------------------------------------------------------------------
+TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/setMenuBarCallback)
+{
+	// registers (or, when passed void/null, clears) the callback invoked
+	// when the platform's menu bar is tapped
+	if(numparams < 1) return TJS_E_BADPARAMCOUNT;
+
+	TVPSetMenuBarCallback(param[0]);
+
+	if(result) result->Clear();
+
+	return TJS_S_OK;
+}
+TJS_END_NATIVE_STATIC_METHOD_DECL_OUTER(/*object to register*/cls,
+	/*func. name*/setMenuBarCallback)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/getTickCount)
 {
