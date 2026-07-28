@@ -3,10 +3,46 @@ package pw.uyjulian.krkrsdl2;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.DialogInterface;
+import android.content.pm.ActivityInfo;
+import android.content.pm.PackageManager;
 
 import org.libsdl.app.SDLActivity;
 
 public class KirikiriSDL2Activity extends SDLActivity {
+
+    // Screen orientation
+
+    /**
+     * This can be overridden (see SDLActivity.setOrientationBis()).
+     * SDLActivity.setOrientation() (called from native code via JNI) always
+     * dispatches through this instance method rather than calling
+     * setRequestedOrientation() itself, specifically so subclasses can
+     * intervene -- overriding here, rather than setOrientation(), is the
+     * documented hook point.
+     *
+     * Why not let SDL decide: setOrientationBis() calls
+     * setRequestedOrientation(SCREEN_ORIENTATION_FULL_SENSOR) whenever
+     * SDL_HINT_ORIENTATIONS isn't set, which silently overrides any
+     * orientation lock declared in AndroidManifest.xml (e.g. a
+     * build-injected android:screenOrientation="sensorLandscape") the
+     * moment SDL starts up. When the Manifest declares an explicit
+     * orientation for this Activity, keep it and skip SDL's override
+     * entirely; only fall back to SDL's own heuristic (window aspect ratio
+     * / SDL_HINT_ORIENTATIONS) when the Manifest leaves it unspecified.
+     */
+    @Override
+    public void setOrientationBis(int w, int h, boolean resizable, String hint) {
+        try {
+            int manifestOrientation = getPackageManager()
+                    .getActivityInfo(getComponentName(), 0).screenOrientation;
+            if (manifestOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) {
+                return;
+            }
+        } catch (PackageManager.NameNotFoundException ex) {
+            ex.printStackTrace();
+        }
+        super.setOrientationBis(w, h, resizable, hint);
+    }
 
     // Select-list dialog
 
