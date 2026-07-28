@@ -2845,6 +2845,16 @@ bool TVPWindowWindow::window_receive_event_input(SDL_Event event)
 				case SDL_MOUSEBUTTONUP:
 				{
 #ifdef __ANDROID__
+					if (event.type == SDL_MOUSEBUTTONDOWN)
+					{
+						// A DOWN always starts a fresh press, so this can never
+						// leave a stale "consumed by the bar" flag from an
+						// earlier press whose UP this window never got a
+						// chance to see (e.g. it arrived while CanDeliverEvents()
+						// was false, such as during a blocking showSelectList
+						// dialog opened from a previous bar tap).
+						this->menuBarPressStarted = false;
+					}
 					if (event.type == SDL_MOUSEBUTTONUP && this->menuBarPressStarted)
 					{
 						// The matching DOWN was consumed by the bar: consume this
