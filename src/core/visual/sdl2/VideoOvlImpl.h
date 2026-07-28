@@ -89,11 +89,31 @@ class tTJSNI_VideoOverlay : public tTJSNI_BaseVideoOverlay
 	// (SDL_PauseAudioDevice only stops the one it knows about). This adds a
 	// source voice to the FAudio engine already opened for BGM/SE instead.
 	FAudioVoice *PlmAudioVoice;
+	// True while audio is disabled only because no FAudio engine exists yet
+	// (no BGM/SE has played this session); PlmTick() retries
+	// PlmTryCreateAudioVoice() every tick until one appears. False (and
+	// never retried) when the .mpg simply has no usable audio stream.
+	bool PlmAudioNeedsEngine;
+	// Fixed-size ring buffer for pl_mpeg audio frames: avoids a per-frame
+	// malloc/free whose free would otherwise need to run from FAudio's
+	// OnBufferEnd, which FAudioSourceVoice_FlushSourceBuffers /
+	// FAudioVoice_DestroyVoice do not reliably call (see PlmQueueAudioSamples()
+	// in VideoOvlImpl.cpp). 1152 matches pl_mpeg's PLM_AUDIO_SAMPLES_PER_FRAME
+	// (static_assert'd there, since this header stays pl_mpeg.h-free); 4 slots
+	// gives FAudio's mixer thread a few frames of headroom to lag behind decode.
+	float PlmAudioRing[4][1152 * 2]; // interleaved stereo
+	int PlmAudioRingNext;
 	bool PlmPlaying;
 	bool PlmFrameDirty;
 	tjs_uint64 PlmLastTickMs;
 	tjs_int PlmVideoWidth;
 	tjs_int PlmVideoHeight;
+
+	// Tries to attach a source voice to TVPGetSharedFAudioEngine(); on
+	// success starts it and re-enables plm audio decode. Returns false (and
+	// leaves PlmAudioNeedsEngine set) if no engine exists yet -- called
+	// once from Play() and then retried from PlmTick() until it succeeds.
+	bool PlmTryCreateAudioVoice();
 #endif
 
 public:
