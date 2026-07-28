@@ -22,6 +22,19 @@
 
 #include "NativeEventQueue.h"
 
+#ifdef __ANDROID__
+// Forward declarations only: pl_mpeg.h and FAudio.h are included solely by
+// VideoOvlImpl.cpp (the only translation unit that needs them), and SDL.h is
+// kept out of this header to avoid pulling it into every file that includes
+// VideoOvlIntf.h.
+struct SDL_Renderer;
+struct SDL_Texture;
+struct SDL_Rect;
+struct FAudioVoice; // audio playback goes through the shared FAudio engine's
+                     // source voice API, not a second SDL audio device (see
+                     // VideoOvlImpl.cpp for why)
+#endif
+
 //---------------------------------------------------------------------------
 // tTJSNI_VideoOverlay : VideoOverlay Native Instance
 //---------------------------------------------------------------------------
@@ -62,6 +75,46 @@ class tTJSNI_VideoOverlay : public tTJSNI_BaseVideoOverlay
 	//! イベントが設定されているフレームより前に現在フレームが移動した時、このフラグは解除される。
 	bool	IsEventPast;
 	int		EventFrame;		//!< イベントを発生させるフレーム
+
+#ifdef __ANDROID__
+	// The buffer handed to PlmDecoder is passed to plm_create_with_memory
+	// with free_when_done=1, so plm_destroy() releases it; this class does
+	// not keep its own pointer to it.
+	void *PlmDecoder;			//!< plm_t*; kept as void* so this header stays pl_mpeg.h-free
+	SDL_Texture *PlmTexture;	//!< render texture, lazily created on first draw
+	tjs_uint8 *PlmRgbBuffer;
+	// Not a second SDL audio device: Android's SDL aaudio/openslES backends
+	// each track only one open output device in a single global, so opening
+	// a second one here would break the app's background auto-pause
+	// (SDL_PauseAudioDevice only stops the one it knows about). This adds a
+	// source voice to the FAudio engine already opened for BGM/SE instead.
+	FAudioVoice *PlmAudioVoice;
+	// True while audio is disabled only because no FAudio engine exists yet
+	// (no BGM/SE has played this session); PlmTick() retries
+	// PlmTryCreateAudioVoice() every tick until one appears. False (and
+	// never retried) when the .mpg simply has no usable audio stream.
+	bool PlmAudioNeedsEngine;
+	// Fixed-size ring buffer for pl_mpeg audio frames: avoids a per-frame
+	// malloc/free whose free would otherwise need to run from FAudio's
+	// OnBufferEnd, which FAudioSourceVoice_FlushSourceBuffers /
+	// FAudioVoice_DestroyVoice do not reliably call (see PlmQueueAudioSamples()
+	// in VideoOvlImpl.cpp). 1152 matches pl_mpeg's PLM_AUDIO_SAMPLES_PER_FRAME
+	// (static_assert'd there, since this header stays pl_mpeg.h-free); 4 slots
+	// gives FAudio's mixer thread a few frames of headroom to lag behind decode.
+	float PlmAudioRing[4][1152 * 2]; // interleaved stereo
+	int PlmAudioRingNext;
+	bool PlmPlaying;
+	bool PlmFrameDirty;
+	tjs_uint64 PlmLastTickMs;
+	tjs_int PlmVideoWidth;
+	tjs_int PlmVideoHeight;
+
+	// Tries to attach a source voice to TVPGetSharedFAudioEngine(); on
+	// success starts it and re-enables plm audio decode. Returns false (and
+	// leaves PlmAudioNeedsEngine set) if no engine exists yet -- called
+	// once from Play() and then retried from PlmTick() until it succeeds.
+	bool PlmTryCreateAudioVoice();
+#endif
 
 public:
 	tTJSNI_VideoOverlay();
@@ -194,6 +247,27 @@ public:
 	void SetRectOffset(tjs_int ofsx, tjs_int ofsy);
 	void DetachVideoOverlay();
 
+#ifdef __ANDROID__
+public:
+	//! @brief Advances decode by the elapsed time since the previous call.
+	//! @return true while playback is still ongoing (the caller uses this to
+	//! decide whether a screen redraw is needed).
+	bool PlmTick(tjs_uint64 nowMs);
+	//! @brief Draws the current decoded frame. destRect/innerWidth/innerHeight
+	//! come from the same transform TickBeat uses for the main game texture,
+	//! mapping this overlay's game-resolution Rect into screen coordinates.
+	void PlmRender(SDL_Renderer *renderer, const SDL_Rect &destRect, int innerWidth, int innerHeight);
+
+	//! @brief Called by the pl_mpeg video decode callback (a file-scope
+	//! trampoline in VideoOvlImpl.cpp). frame is really a plm_frame_t*, taken
+	//! as void* because pl_mpeg.h typedefs it as an anonymous struct that
+	//! cannot be forward-declared here.
+	void PlmWriteVideoFrame(void *frame);
+	//! @brief Called by the pl_mpeg audio decode callback; samples is really
+	//! a plm_samples_t* (same reason as PlmWriteVideoFrame).
+	void PlmQueueAudioSamples(void *samples);
+#endif
+
 private:
 	void WndProc( NativeEvent& ev );
 		// UtilWindow's window procedure
@@ -201,5 +275,15 @@ private:
 
 };
 //---------------------------------------------------------------------------
+
+#ifdef __ANDROID__
+//! @brief Advances decode by one tick for every playing VideoOverlay instance.
+//! @return true if any of them are still playing; the caller (TickBeat) uses
+//! this to decide whether to set needsGraphicUpdate.
+extern bool TVPPlmTickAll();
+//! @brief Draws every playing, visible VideoOverlay instance.
+extern void TVPPlmRenderAll(SDL_Renderer *renderer, const SDL_Rect &destRect,
+	int innerWidth, int innerHeight);
+#endif
 
 #endif

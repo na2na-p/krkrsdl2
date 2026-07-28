@@ -27,6 +27,15 @@
 #include <SDL_syswm.h>
 #endif
 #include <SDL.h>
+#ifdef __ANDROID__
+// Declared in VideoOvlImpl.h/.cpp; not included directly here to avoid
+// pulling the whole VideoOverlay native-instance declaration (and its
+// TJS/storage header dependencies) into the application/window translation
+// unit for the sake of two free functions.
+extern bool TVPPlmTickAll();
+extern void TVPPlmRenderAll(SDL_Renderer *renderer, const SDL_Rect &destRect,
+	int innerWidth, int innerHeight);
+#endif
 #ifdef _WIN32
 #include <shellapi.h>
 #include <stdlib.h>
@@ -1696,6 +1705,12 @@ void TVPWindowWindow::Show()
 }
 void TVPWindowWindow::TickBeat()
 {
+#ifdef __ANDROID__
+	if (TVPPlmTickAll())
+	{
+		this->needsGraphicUpdate = true;
+	}
+#endif
 	if (!this->visibilityHasInitialized)
 	{
 		this->visibilityHasInitialized = true;
@@ -1751,6 +1766,9 @@ void TVPWindowWindow::TickBeat()
 					srcrect.w = this->GetInnerWidth();
 					srcrect.h = this->GetInnerHeight();
 					SDL_RenderCopy(this->renderer, this->texture, &srcrect, &destrect);
+#ifdef __ANDROID__
+					TVPPlmRenderAll(this->renderer, destrect, this->GetInnerWidth(), this->GetInnerHeight());
+#endif
 #elif defined(KRKRSDL2_RENDERER_FULL_UPDATES)
 					SDL_RenderCopy(this->renderer, this->texture, nullptr, nullptr);
 #else
