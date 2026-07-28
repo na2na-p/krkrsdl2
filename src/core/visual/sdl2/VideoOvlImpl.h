@@ -23,13 +23,16 @@
 #include "NativeEventQueue.h"
 
 #ifdef __ANDROID__
-// Forward declarations only: pl_mpeg.h is included solely by VideoOvlImpl.cpp
-// (the only translation unit that needs the decoder), and SDL.h is kept out
-// of this header to avoid pulling it into every file that includes
+// Forward declarations only: pl_mpeg.h and FAudio.h are included solely by
+// VideoOvlImpl.cpp (the only translation unit that needs them), and SDL.h is
+// kept out of this header to avoid pulling it into every file that includes
 // VideoOvlIntf.h.
 struct SDL_Renderer;
 struct SDL_Texture;
 struct SDL_Rect;
+struct FAudioVoice; // audio playback goes through the shared FAudio engine's
+                     // source voice API, not a second SDL audio device (see
+                     // VideoOvlImpl.cpp for why)
 #endif
 
 //---------------------------------------------------------------------------
@@ -74,13 +77,18 @@ class tTJSNI_VideoOverlay : public tTJSNI_BaseVideoOverlay
 	int		EventFrame;		//!< イベントを発生させるフレーム
 
 #ifdef __ANDROID__
-	// PlmDecoderに渡したファイル全体のバッファはplm_create_with_memoryへ
-	// free_when_done=1で渡しており、plm_destroy()が解放するためこのクラスでは
-	// ポインタを保持しない
-	void *PlmDecoder;			//!< plm_t*。このヘッダをpl_mpeg.h非依存に保つためvoid*で保持
-	SDL_Texture *PlmTexture;	//!< 描画用テクスチャ。初回描画時に遅延生成
+	// The buffer handed to PlmDecoder is passed to plm_create_with_memory
+	// with free_when_done=1, so plm_destroy() releases it; this class does
+	// not keep its own pointer to it.
+	void *PlmDecoder;			//!< plm_t*; kept as void* so this header stays pl_mpeg.h-free
+	SDL_Texture *PlmTexture;	//!< render texture, lazily created on first draw
 	tjs_uint8 *PlmRgbBuffer;
-	unsigned int PlmAudioDevice;	//!< SDL_AudioDeviceID（SDL2ではUint32のtypedef）
+	// Not a second SDL audio device: Android's SDL aaudio/openslES backends
+	// each track only one open output device in a single global, so opening
+	// a second one here would break the app's background auto-pause
+	// (SDL_PauseAudioDevice only stops the one it knows about). This adds a
+	// source voice to the FAudio engine already opened for BGM/SE instead.
+	FAudioVoice *PlmAudioVoice;
 	bool PlmPlaying;
 	bool PlmFrameDirty;
 	tjs_uint64 PlmLastTickMs;
@@ -221,20 +229,22 @@ public:
 
 #ifdef __ANDROID__
 public:
-	//! @brief 前回呼び出しからの経過時間分デコードを進める
-	//! @return 再生継続中ならtrue（呼び出し側が画面再描画要否を判断するために使う）
+	//! @brief Advances decode by the elapsed time since the previous call.
+	//! @return true while playback is still ongoing (the caller uses this to
+	//! decide whether a screen redraw is needed).
 	bool PlmTick(tjs_uint64 nowMs);
-	//! @brief 現在のデコード済みフレームを描画する
-	//! destRect/innerWidth/innerHeightはTickBeatがゲーム画面テクスチャに使うものと
-	//! 同じ変換元で、ゲーム解像度で保持しているRectを画面座標へ写像するために使う
+	//! @brief Draws the current decoded frame. destRect/innerWidth/innerHeight
+	//! come from the same transform TickBeat uses for the main game texture,
+	//! mapping this overlay's game-resolution Rect into screen coordinates.
 	void PlmRender(SDL_Renderer *renderer, const SDL_Rect &destRect, int innerWidth, int innerHeight);
 
-	//! @brief pl_mpegの動画デコードコールバック（VideoOvlImpl.cpp内のファイルスコープの
-	//! トランポリン関数）から呼ばれる。frameは実際にはplm_frame_t*だが、pl_mpeg.h内で
-	//! 無名structとしてtypedefされ前方宣言できないためvoid*で受ける
+	//! @brief Called by the pl_mpeg video decode callback (a file-scope
+	//! trampoline in VideoOvlImpl.cpp). frame is really a plm_frame_t*, taken
+	//! as void* because pl_mpeg.h typedefs it as an anonymous struct that
+	//! cannot be forward-declared here.
 	void PlmWriteVideoFrame(void *frame);
-	//! @brief pl_mpegの音声デコードコールバックから呼ばれる。samplesは実際には
-	//! plm_samples_t*（理由はPlmWriteVideoFrameと同じ）
+	//! @brief Called by the pl_mpeg audio decode callback; samples is really
+	//! a plm_samples_t* (same reason as PlmWriteVideoFrame).
 	void PlmQueueAudioSamples(void *samples);
 #endif
 
@@ -247,11 +257,11 @@ private:
 //---------------------------------------------------------------------------
 
 #ifdef __ANDROID__
-//! @brief 再生中の全VideoOverlayインスタンスのデコードを1ティック進める
-//! @return いずれかが再生中ならtrue。呼び出し側(TickBeat)はこれをneedsGraphicUpdateの
-//! 判断材料にする
+//! @brief Advances decode by one tick for every playing VideoOverlay instance.
+//! @return true if any of them are still playing; the caller (TickBeat) uses
+//! this to decide whether to set needsGraphicUpdate.
 extern bool TVPPlmTickAll();
-//! @brief 再生中かつvisibleな全VideoOverlayインスタンスを描画する
+//! @brief Draws every playing, visible VideoOverlay instance.
 extern void TVPPlmRenderAll(SDL_Renderer *renderer, const SDL_Rect &destRect,
 	int innerWidth, int innerHeight);
 #endif

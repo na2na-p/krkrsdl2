@@ -15,6 +15,15 @@
 #include <FAudio.h>
 
 class FAudioStream;
+class FAudioDevice;
+
+// Only one FAudioDevice is ever constructed (see the class comment on
+// iTVPAudioDevice), so this is used by TVPGetSharedFAudioEngine() to let
+// other fork code (e.g. Android's pl_mpeg video playback) add a source
+// voice to the same engine/mastering voice instead of opening a second
+// platform audio device.
+static FAudioDevice* TVPSharedFAudioDeviceInstance = nullptr;
+
 class FAudioDevice : public iTVPAudioDevice
 {
 	FAudio* FAudioObj;
@@ -42,10 +51,15 @@ public:
 		FAudioObj = nullptr;
 		MasteringVoiceObj = nullptr;
 		Volume = 100000;
+		TVPSharedFAudioDeviceInstance = this;
 	}
 
 	virtual ~FAudioDevice() override
 	{
+		if (TVPSharedFAudioDeviceInstance == this)
+		{
+			TVPSharedFAudioDeviceInstance = nullptr;
+		}
 	}
 
 	virtual void Initialize(tTVPAudioInitParam& param) override
@@ -456,6 +470,15 @@ iTVPAudioStream* FAudioDevice::CreateAudioStream(tTVPAudioStreamParam& param)
 	FAudioStream* stream = new FAudioStream(this, param);
 	AddStream(stream);
 	return stream;
+}
+
+FAudio* TVPGetSharedFAudioEngine()
+{
+	if (TVPSharedFAudioDeviceInstance == nullptr)
+	{
+		return nullptr;
+	}
+	return TVPSharedFAudioDeviceInstance->GetFAudio();
 }
 #endif
 

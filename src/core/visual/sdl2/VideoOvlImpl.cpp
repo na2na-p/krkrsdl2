@@ -38,11 +38,21 @@
 #endif
 #ifdef __ANDROID__
 #include <cstdlib>
+#include <cstring>
 #include <SDL.h>
 // PL_MPEG_IMPLEMENTATION must be defined in exactly one translation unit;
 // this is that unit.
 #define PL_MPEG_IMPLEMENTATION
 #include "pl_mpeg.h"
+// Audio playback does not use a second SDL audio device: Android's SDL
+// aaudio/openslES backends each track only one open output device in a
+// single global (see external/SDL/src/audio/aaudio/SDL_aaudio.c), so opening
+// a second one here would silently clobber the one FAudio already opened
+// for BGM/SE, breaking the app's background auto-pause. Instead this adds a
+// source voice to the same shared FAudio engine via TVPGetSharedFAudioEngine()
+// (defined in FAudioDevice.cpp).
+#include <FAudio.h>
+extern FAudio *TVPGetSharedFAudioEngine();
 #endif
 
 //---------------------------------------------------------------------------
@@ -92,12 +102,35 @@ static void TVPPlmAudioDecodeCallback(plm_t *plm, plm_samples_t *samples, void *
 	static_cast<tTJSNI_VideoOverlay *>(user)->PlmQueueAudioSamples(samples);
 }
 //---------------------------------------------------------------------------
+// FAudio requires pAudioData to stay valid until this fires (it is not
+// copied by FAudioSourceVoice_SubmitSourceBuffer). PlmQueueAudioSamples()
+// malloc's the submitted buffer and sets it as pContext, so freeing it here
+// is all that is needed; this is stateless, so one instance is shared by
+// every overlay's source voice. FAudio may call this from its own mixer
+// thread, so keep it to just free().
+static void FAUDIOCALL TVPPlmAudioBufferEndCallback(FAudioVoiceCallback *callback, void *pBufferContext)
+{
+	free(pBufferContext);
+}
+static FAudioVoiceCallback TVPPlmAudioVoiceCallback = {
+	TVPPlmAudioBufferEndCallback, // OnBufferEnd
+	NULL, // OnBufferStart
+	NULL, // OnLoopEnd
+	NULL, // OnStreamEnd
+	NULL, // OnVoiceError
+	NULL, // OnVoiceProcessingPassEnd
+	NULL, // OnVoiceProcessingPassStart
+};
+//---------------------------------------------------------------------------
 bool TVPPlmTickAll()
 {
-	// PlmTick() may call SetStatusAsync(Stop), whose handler can synchronously
-	// Close() the overlay (removing it from TVPVideoOverlayVector). Iterate a
-	// snapshot so that erase() during the loop can never invalidate our
-	// iterator.
+	// PlmTick() calls SetStatusAsync(Stop) on end-of-stream, which posts via
+	// TVP_EPT_POST (see external/krkrz/base/EventIntf.cpp) and is therefore
+	// delivered later on the event loop, not synchronously from here -- so
+	// the onStatusChanged handler's Close() cannot reenter this loop. The
+	// snapshot below is defensive insurance against that assumption ever
+	// changing (or against a future caller of Close() during iteration),
+	// not a fix for an observed reentrancy.
 	std::vector<tTJSNI_VideoOverlay*> overlays(TVPVideoOverlayVector);
 	bool anyPlaying = false;
 	tjs_uint64 now = SDL_GetTicks64();
@@ -165,7 +198,7 @@ tTJSNI_VideoOverlay::tTJSNI_VideoOverlay()
 	PlmDecoder = NULL;
 	PlmTexture = NULL;
 	PlmRgbBuffer = NULL;
-	PlmAudioDevice = 0;
+	PlmAudioVoice = NULL;
 	PlmPlaying = false;
 	PlmFrameDirty = false;
 	PlmLastTickMs = 0;
@@ -372,10 +405,22 @@ void tTJSNI_VideoOverlay::Close()
 	Bitmap[0] = Bitmap[1] = NULL;
 	BmpBits[0] = BmpBits[1] = NULL;
 #elif defined(__ANDROID__)
-	if(PlmAudioDevice != 0)
+	if(PlmAudioVoice)
 	{
-		SDL_CloseAudioDevice(static_cast<SDL_AudioDeviceID>(PlmAudioDevice));
-		PlmAudioDevice = 0;
+		// Only touch the voice while the shared engine is still alive.
+		// TVPShutdownVideoOverlayAtExit (TVP_ATEXIT_PRI_PREPARE) always runs
+		// before TVPUninitAudioDeviceAtExit (TVP_ATEXIT_PRI_RELEASE, see
+		// external/krkrz/sound/QueueSoundBufferImpl.cpp) which destroys the
+		// engine and every voice on it, so this is normally a no-op guard;
+		// it exists so a dangling PlmAudioVoice can never be dereferenced if
+		// that ordering assumption is ever broken.
+		if(TVPGetSharedFAudioEngine())
+		{
+			FAudioSourceVoice_Stop(PlmAudioVoice, 0, FAUDIO_COMMIT_NOW);
+			FAudioSourceVoice_FlushSourceBuffers(PlmAudioVoice); // frees any in-flight buffers via TVPPlmAudioBufferEndCallback
+			FAudioVoice_DestroyVoice(PlmAudioVoice);
+		}
+		PlmAudioVoice = NULL;
 	}
 	if(PlmTexture)
 	{
@@ -417,6 +462,38 @@ void tTJSNI_VideoOverlay::Shutdown()
 		throw;
 	}
 	CanDeliverEvents = c;
+#elif defined(__ANDROID__)
+	// Called from TVPShutdownVideoOverlay() while it iterates
+	// TVPVideoOverlayVector, so this must not call TVPRemoveVideoOverlay()
+	// (that would erase() from the vector mid-iteration) and, per the
+	// contract above, must not fire onStatusChanged -- so this releases the
+	// same resources as Close() but skips SetStatus() and the registry
+	// removal.
+	if(PlmAudioVoice)
+	{
+		// see Close() for why this checks the engine is still alive
+		if(TVPGetSharedFAudioEngine())
+		{
+			FAudioSourceVoice_Stop(PlmAudioVoice, 0, FAUDIO_COMMIT_NOW);
+			FAudioSourceVoice_FlushSourceBuffers(PlmAudioVoice);
+			FAudioVoice_DestroyVoice(PlmAudioVoice);
+		}
+		PlmAudioVoice = NULL;
+	}
+	if(PlmTexture)
+	{
+		SDL_DestroyTexture(PlmTexture);
+		PlmTexture = NULL;
+	}
+	delete [] PlmRgbBuffer;
+	PlmRgbBuffer = NULL;
+	if(PlmDecoder)
+	{
+		plm_destroy(static_cast<plm_t *>(PlmDecoder));
+		PlmDecoder = NULL;
+	}
+	PlmPlaying = false;
+	PlmFrameDirty = false;
 #endif
 }
 //---------------------------------------------------------------------------
@@ -441,29 +518,51 @@ void tTJSNI_VideoOverlay::Play()
 #elif defined(__ANDROID__)
 	if(!PlmDecoder || PlmPlaying) return;
 
-	if(PlmAudioDevice != 0)
+	if(PlmAudioVoice)
 	{
-		// re-entering Play() after Stop(): the device is kept open (only
-		// paused) so playback can resume without reopening it
-		SDL_PauseAudioDevice(static_cast<SDL_AudioDeviceID>(PlmAudioDevice), 0);
+		// re-entering Play() after Stop(): the voice is kept around (only
+		// stopped) so playback can resume without recreating it
+		FAudioSourceVoice_Start(PlmAudioVoice, 0, FAUDIO_COMMIT_NOW);
 	}
-	else if(SDL_InitSubSystem(SDL_INIT_AUDIO) == 0)
+	else
 	{
-		SDL_AudioSpec want, have;
-		SDL_zero(want);
-		want.freq = plm_get_samplerate(static_cast<plm_t *>(PlmDecoder));
-		want.format = AUDIO_F32SYS;
-		want.channels = 2;
-		want.samples = 4096;
-		SDL_AudioDeviceID dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-		if(dev != 0)
+		FAudio *engine = TVPGetSharedFAudioEngine();
+		if(engine)
 		{
-			PlmAudioDevice = dev;
-			// pl_mpeg docs recommend lead_time = SDL_AudioSpec.samples / samplerate
-			// for SDL2 output
-			plm_set_audio_lead_time(static_cast<plm_t *>(PlmDecoder),
-				static_cast<double>(have.samples) / static_cast<double>(have.freq));
-			SDL_PauseAudioDevice(dev, 0);
+			FAudioWaveFormatEx fmt;
+			memset(&fmt, 0, sizeof(fmt));
+			fmt.wFormatTag = FAUDIO_FORMAT_IEEE_FLOAT;
+			fmt.nChannels = 2;
+			fmt.nSamplesPerSec = static_cast<uint32_t>(plm_get_samplerate(static_cast<plm_t *>(PlmDecoder)));
+			fmt.wBitsPerSample = 32;
+			fmt.nBlockAlign = static_cast<uint16_t>((fmt.wBitsPerSample / 8) * fmt.nChannels);
+			fmt.nAvgBytesPerSec = fmt.nSamplesPerSec * fmt.nBlockAlign;
+
+			FAudioSourceVoice *voice = NULL;
+			uint32_t hr = FAudio_CreateSourceVoice(engine, &voice, &fmt, 0,
+				FAUDIO_DEFAULT_FREQ_RATIO, &TVPPlmAudioVoiceCallback, NULL, NULL);
+			if(hr == 0 && voice != NULL)
+			{
+				PlmAudioVoice = voice;
+				// One MP2 frame (PLM_AUDIO_SAMPLES_PER_FRAME samples) is
+				// submitted per audio decode callback, so that is how far
+				// ahead of the video the audio decode runs; match the lead
+				// time to it (see pl_mpeg.h's plm_set_audio_lead_time docs).
+				plm_set_audio_lead_time(static_cast<plm_t *>(PlmDecoder),
+					static_cast<double>(PLM_AUDIO_SAMPLES_PER_FRAME) / static_cast<double>(fmt.nSamplesPerSec));
+				FAudioSourceVoice_Start(voice, 0, FAUDIO_COMMIT_NOW);
+				// undo a previous Play() call's plm_set_audio_enabled(.., 0),
+				// in case this Play() is a retry that now finds an engine
+				plm_set_audio_enabled(static_cast<plm_t *>(PlmDecoder), 1);
+			}
+		}
+		if(!PlmAudioVoice)
+		{
+			// No shared FAudio engine yet (e.g. no BGM/SE has played this
+			// session) or voice creation failed: play the video silently
+			// instead of decoding audio into nothing every frame.
+			plm_set_audio_enabled(static_cast<plm_t *>(PlmDecoder), 0);
+			TVPAddLog(TJS_W("VideoOverlay: audio disabled (no FAudio source voice available)"));
 		}
 	}
 
@@ -490,10 +589,10 @@ void tTJSNI_VideoOverlay::Stop()
 	if(!PlmDecoder) return;
 
 	PlmPlaying = false;
-	if(PlmAudioDevice != 0)
+	if(PlmAudioVoice)
 	{
-		SDL_PauseAudioDevice(static_cast<SDL_AudioDeviceID>(PlmAudioDevice), 1);
-		SDL_ClearQueuedAudio(static_cast<SDL_AudioDeviceID>(PlmAudioDevice));
+		FAudioSourceVoice_Stop(PlmAudioVoice, 0, FAUDIO_COMMIT_NOW);
+		FAudioSourceVoice_FlushSourceBuffers(PlmAudioVoice);
 	}
 	SetStatus(tTVPVideoOverlayStatus::Stop);
 #endif
@@ -1586,8 +1685,8 @@ bool tTJSNI_VideoOverlay::PlmTick(tjs_uint64 nowMs)
 	if(plm_has_ended(static_cast<plm_t *>(PlmDecoder)))
 	{
 		PlmPlaying = false;
-		if(PlmAudioDevice != 0)
-			SDL_PauseAudioDevice(static_cast<SDL_AudioDeviceID>(PlmAudioDevice), 1);
+		if(PlmAudioVoice)
+			FAudioSourceVoice_Stop(PlmAudioVoice, 0, FAUDIO_COMMIT_NOW);
 		SetStatusAsync(tTVPVideoOverlayStatus::Stop);
 		return false;
 	}
@@ -1634,10 +1733,25 @@ void tTJSNI_VideoOverlay::PlmWriteVideoFrame(void *frame)
 //---------------------------------------------------------------------------
 void tTJSNI_VideoOverlay::PlmQueueAudioSamples(void *samples)
 {
-	if(PlmAudioDevice == 0) return;
+	if(!PlmAudioVoice) return;
 	plm_samples_t *s = static_cast<plm_samples_t *>(samples);
-	SDL_QueueAudio(static_cast<SDL_AudioDeviceID>(PlmAudioDevice), s->interleaved,
-		s->count * 2 * sizeof(float));
+
+	// FAudioSourceVoice_SubmitSourceBuffer reads pAudioData in place rather
+	// than copying it (see FAudioBuffer in FAudio.h), so the interleaved
+	// samples must be copied to a buffer that outlives this callback;
+	// TVPPlmAudioBufferEndCallback frees it once FAudio is done with it.
+	size_t bytes = static_cast<size_t>(s->count) * 2 * sizeof(float);
+	float *copy = static_cast<float *>(malloc(bytes));
+	if(!copy) return; // drop this frame's audio rather than crash
+
+	memcpy(copy, s->interleaved, bytes);
+
+	FAudioBuffer buf;
+	memset(&buf, 0, sizeof(buf));
+	buf.AudioBytes = static_cast<uint32_t>(bytes);
+	buf.pAudioData = reinterpret_cast<const uint8_t *>(copy);
+	buf.pContext = copy;
+	FAudioSourceVoice_SubmitSourceBuffer(PlmAudioVoice, &buf, NULL);
 }
 //---------------------------------------------------------------------------
 #endif
