@@ -80,6 +80,40 @@ static void TVPShowSimpleMessageBox(const ttstr & text, const ttstr & caption)
 	}
 }
 //---------------------------------------------------------------------------
+// TVPShowYesNoMessageBox
+//---------------------------------------------------------------------------
+static tjs_int TVPShowYesNoMessageBox(const ttstr & text, const ttstr & caption)
+{
+	// Single-window platforms (e.g. Android) cannot host the KAG
+	// Window-based yes/no dialog, so expose a blocking native message box
+	// with yes/no buttons instead. Returns 1 for yes, 0 for no.
+	tjs_string t_utf16 = text.AsStdString();
+	std::string t_utf8;
+	tjs_string c_utf16 = caption.AsStdString();
+	std::string c_utf8;
+	if (!TVPUtf16ToUtf8(t_utf8, t_utf16) || !TVPUtf16ToUtf8(c_utf8, c_utf16))
+	{
+		return 0;
+	}
+	const SDL_MessageBoxButtonData buttons[] = {
+		{ SDL_MESSAGEBOX_BUTTON_ESCAPE_KEY_DEFAULT, 0, "いいえ" },
+		{ SDL_MESSAGEBOX_BUTTON_RETURN_KEY_DEFAULT, 1, "はい" },
+	};
+	SDL_MessageBoxData data = {};
+	data.flags = SDL_MESSAGEBOX_INFORMATION;
+	data.window = nullptr;
+	data.title = c_utf8.c_str();
+	data.message = t_utf8.c_str();
+	data.numbuttons = 2;
+	data.buttons = buttons;
+	int hit = 0;
+	if (SDL_ShowMessageBox(&data, &hit) != 0)
+	{
+		return 0;
+	}
+	return (tjs_int)hit;
+}
+//---------------------------------------------------------------------------
 
 
 
@@ -893,6 +927,28 @@ TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/inform)
 }
 TJS_END_NATIVE_STATIC_METHOD_DECL_OUTER(/*object to register*/cls,
 	/*func. name*/inform)
+//----------------------------------------------------------------------
+TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/showYesNoMessageBox)
+{
+	// show a blocking yes/no message box; returns 1 for yes, 0 for no
+	if(numparams < 1) return TJS_E_BADPARAMCOUNT;
+
+	ttstr text = *param[0];
+
+	ttstr caption;
+	if(numparams >= 2 && param[1]->Type() != tvtVoid)
+		caption = *param[1];
+	else
+		caption = TJS_W("Confirm");
+
+	tjs_int hit = TVPShowYesNoMessageBox(text, caption);
+
+	if(result) *result = hit;
+
+	return TJS_S_OK;
+}
+TJS_END_NATIVE_STATIC_METHOD_DECL_OUTER(/*object to register*/cls,
+	/*func. name*/showYesNoMessageBox)
 //----------------------------------------------------------------------
 TJS_BEGIN_NATIVE_METHOD_DECL(/*func. name*/getTickCount)
 {
