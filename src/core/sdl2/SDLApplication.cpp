@@ -1734,6 +1734,7 @@ void TVPWindowWindow::Swap()
 void TVPWindowWindow::Show()
 {
 }
+#ifdef __ANDROID__
 namespace
 {
 	// left/top/right/bottom safe-area insets in px (display cutout ∪ system
