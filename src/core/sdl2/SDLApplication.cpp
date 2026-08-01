@@ -3061,6 +3061,17 @@ bool TVPWindowWindow::window_receive_event_input(SDL_Event event)
 						// was false, such as during a blocking showSelectList
 						// dialog opened from a previous bar tap).
 						this->menuBarPressStarted = false;
+						if (event.button.button == SDL_BUTTON_LEFT)
+						{
+							// Same hazard as menuBarPressStarted above, same fix:
+							// without this, a pending back-click whose flushing
+							// UP this window never saw (e.g. lost to a
+							// background transition while the drag that set it
+							// was still in progress) would otherwise survive to
+							// fire as a phantom right click on this unrelated
+							// press's eventual UP.
+							this->pendingBackRightClick = false;
+						}
 					}
 					if (event.type == SDL_MOUSEBUTTONUP && this->menuBarPressStarted)
 					{
