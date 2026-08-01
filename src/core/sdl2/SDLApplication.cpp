@@ -1845,6 +1845,25 @@ bool TVPWindowWindow::GetMenuBarRect(SDL_Rect &out) const
 		return c < 32 ? 32 : c;
 	};
 
+	// Fits the bar's thickness inside whatever band space is left once the
+	// leading-edge safe-area inset is subtracted from the letterbox band
+	// (bandAvailable), so that after the inset offset is applied to out.x/
+	// out.y below, the bar's trailing edge still lands at or before the
+	// band's own edge -- out.x + out.w <= destLeft for the landscape case,
+	// out.y + out.h <= destTop for the portrait case -- preserving "never
+	// overlaps the rendered game frame" from the comment above. When the
+	// band itself is narrower than the cap floor (32px) -- the letterbox is
+	// thinner than the safe-area inset, a rare device/orientation
+	// combination -- honoring both "start past the inset" and "end within
+	// the band" is impossible, so this keeps the 32px floor instead and
+	// accepts a small overlap onto the game frame: a bar the user can still
+	// find and tap outweighs one that stays clear of the game area but
+	// sits fully under an obscuring cutout.
+	auto fitWithinBand = [](int desired, int bandAvailable) {
+		if (bandAvailable >= 32) return desired < bandAvailable ? desired : bandAvailable;
+		return 32;
+	};
+
 	tjs_int destTop = this->LastSentDrawDeviceDestRect.top;
 	tjs_int destLeft = this->LastSentDrawDeviceDestRect.left;
 
@@ -1855,9 +1874,11 @@ bool TVPWindowWindow::GetMenuBarRect(SDL_Rect &out) const
 	{
 		// Portrait letterbox (top/bottom black bars): bar sits at the screen
 		// top, shifted below any cutout/status-bar inset so it isn't itself
-		// clipped by the cutout.
-		int h = cap(output_h);
-		if (destTop < h) h = destTop;
+		// clipped by the cutout; thickness is fit to what remains of the
+		// band below that inset (see fitWithinBand above), so the bar still
+		// never overlaps the rendered game frame except in that helper's
+		// documented rare-device fallback.
+		int h = fitWithinBand(cap(output_h), destTop - insets.top);
 		out.x = 0;
 		out.y = insets.top;
 		out.w = output_w;
@@ -1868,9 +1889,10 @@ bool TVPWindowWindow::GetMenuBarRect(SDL_Rect &out) const
 		// Landscape letterbox (left/right black bars): bar sits at the
 		// screen left edge -- not the right edge, so it stops colliding with
 		// the right-edge back-gesture swipe area on right-handed grips --
-		// shifted right past any left-edge cutout inset.
-		int w = cap(output_w);
-		if (destLeft < w) w = destLeft;
+		// shifted right past any left-edge cutout inset; width is fit to
+		// what remains of the band past that inset (see fitWithinBand
+		// above), with the same rare-device fallback.
+		int w = fitWithinBand(cap(output_w), destLeft - insets.left);
 		out.x = insets.left;
 		out.y = 0;
 		out.w = w;
@@ -1878,13 +1900,19 @@ bool TVPWindowWindow::GetMenuBarRect(SDL_Rect &out) const
 	}
 	else
 	{
-		// No letterbox: fall back to overlaying the screen top, same inset
-		// treatment as the portrait letterbox case above since this is also
-		// a top-edge bar.
+		// No letterbox: fall back to overlaying the screen top. There is no
+		// black band to avoid overlapping here regardless of insets -- the
+		// game already fills the screen, so this branch has always drawn
+		// over it -- so this only clamps against running off the bottom
+		// edge of the screen, not against a no-overlap invariant that does
+		// not apply in this branch.
+		int h = cap(output_h);
+		if (insets.top + h > output_h) h = output_h - insets.top;
+		if (h < 0) h = 0;
 		out.x = 0;
 		out.y = insets.top;
 		out.w = output_w;
-		out.h = cap(output_h);
+		out.h = h;
 	}
 	return true;
 }
