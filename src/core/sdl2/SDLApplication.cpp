@@ -37,6 +37,7 @@ extern void TVPPlmRenderAll(SDL_Renderer *renderer, const SDL_Rect &destRect,
 	int innerWidth, int innerHeight);
 // For the safe-area-insets JNI query used by GetMenuBarRect() below.
 #include <jni.h>
+#include "AndroidJNIStaticMethod.h"
 #endif
 #ifdef _WIN32
 #include <shellapi.h>
@@ -1756,37 +1757,25 @@ namespace
 	// bars), as reported by KirikiriSDL2Activity.getSafeAreaInsets().
 	struct TVPSafeAreaInsets { int left = 0, top = 0, right = 0, bottom = 0; };
 
-	// Resolves and calls Activity.getSafeAreaInsets() via JNI, following
-	// TVPShowSelectListViaJNI's idiom in SystemImpl.cpp (resolve the method
-	// fresh each call, fail closed to false on any missing class/method/
-	// exception). Not shared with that function directly: this one returns
-	// an int[4] rather than blocking on a dialog result, and is called from
-	// the render path (see TVPGetCachedSafeAreaInsets below), not input
-	// handling, so keeping it local avoids adding an Android-only entry
-	// point to the cross-platform SystemImpl.h for a single caller.
+	// Resolves and calls Activity.getSafeAreaInsets() via JNI, using the
+	// shared TVPJNIActivityMethodResolver (AndroidJNIStaticMethod.h) for
+	// env/Activity/class resolution and fail-closed method lookup. Stays a
+	// free function local to this file rather than exposed via
+	// SystemImpl.h: it returns an int[4] rather than blocking on a dialog
+	// result, and is only ever called from the render path below
+	// (TVPGetCachedSafeAreaInsets), not from input handling.
 	bool TVPFetchSafeAreaInsetsViaJNI(TVPSafeAreaInsets &out)
 	{
-		JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
-		if (!env) return false;
-
-		jobject activity = (jobject)SDL_AndroidGetActivity();
-		if (!activity) return false;
-
-		jclass activityClass = env->GetObjectClass(activity);
-		env->DeleteLocalRef(activity);
-		if (!activityClass) return false;
+		TVPJNIActivityMethodResolver resolver;
+		if (!resolver.IsValid()) return false;
+		JNIEnv *env = resolver.GetEnv();
 
 		bool ok = false;
-		jmethodID mid = env->GetStaticMethodID(activityClass, "getSafeAreaInsets", "()[I");
-		if (env->ExceptionCheck())
-		{
-			env->ExceptionClear();
-			mid = nullptr;
-		}
+		jmethodID mid = resolver.GetStaticMethod("getSafeAreaInsets", "()[I");
 
 		if (mid)
 		{
-			jintArray insets = (jintArray)env->CallStaticObjectMethod(activityClass, mid);
+			jintArray insets = (jintArray)env->CallStaticObjectMethod(resolver.GetActivityClass(), mid);
 			if (env->ExceptionCheck())
 			{
 				env->ExceptionClear();
@@ -1804,7 +1793,6 @@ namespace
 			if (insets) env->DeleteLocalRef(insets);
 		}
 
-		env->DeleteLocalRef(activityClass);
 		return ok;
 	}
 
