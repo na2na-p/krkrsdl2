@@ -39,7 +39,12 @@ def get_cmake_arguments() {
 }
 
 android {
-    compileSdkVersion 26
+    // 28 (not 26) so android.view.DisplayCutout is resolvable at compile
+    // time for the safe-area-insets query below; minSdkVersion/
+    // targetSdkVersion stay put since raising compileSdkVersion only adds
+    // newer APIs to the compile classpath and does not change runtime
+    // behavior on its own.
+    compileSdkVersion 28
     defaultConfig {
         if (buildAsApplication) {
             applicationId "pw.uyjulian.krkrsdl2"

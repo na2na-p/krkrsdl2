@@ -5,6 +5,11 @@ import android.app.AlertDialog;
 import android.content.DialogInterface;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
+import android.os.Build;
+import android.os.Bundle;
+import android.view.DisplayCutout;
+import android.view.View;
+import android.view.WindowInsets;
 
 import org.libsdl.app.SDLActivity;
 
@@ -42,6 +47,73 @@ public class KirikiriSDL2Activity extends SDLActivity {
             ex.printStackTrace();
         }
         super.setOrientationBis(w, h, resizable, hint);
+    }
+
+    // Safe-area insets (cutout + system bars)
+
+    /**
+     * Cached {left, top, right, bottom} safe-area insets in px, reassigned
+     * wholesale (never mutated in place) so a reader on another thread never
+     * observes a half-updated array without needing a lock.
+     */
+    private static volatile int[] cachedSafeAreaInsets = new int[]{0, 0, 0, 0};
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        // View.OnApplyWindowInsetsListener requires API 21; below that,
+        // devices predate display cutouts anyway, so the {0,0,0,0} default
+        // above is already correct and no listener is installed.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            getWindow().getDecorView().setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
+                @Override
+                public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
+                    updateCachedSafeAreaInsets(insets);
+                    return insets;
+                }
+            });
+        }
+    }
+
+    /**
+     * The system dispatches WindowInsets to the listener above on initial
+     * attach and again on every later change (rotation, cutout-mode change,
+     * IME, ...), so refreshing the cache here tracks all of them without
+     * native code polling every frame.
+     */
+    private static void updateCachedSafeAreaInsets(WindowInsets insets) {
+        int left = insets.getSystemWindowInsetLeft();
+        int top = insets.getSystemWindowInsetTop();
+        int right = insets.getSystemWindowInsetRight();
+        int bottom = insets.getSystemWindowInsetBottom();
+
+        // DisplayCutout was added in API 28; its safe insets can exceed the
+        // system-bar insets above on notch/hole-punch devices when the
+        // window draws edge-to-edge, so keep the larger of the two per side.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            DisplayCutout cutout = insets.getDisplayCutout();
+            if (cutout != null) {
+                left = Math.max(left, cutout.getSafeInsetLeft());
+                top = Math.max(top, cutout.getSafeInsetTop());
+                right = Math.max(right, cutout.getSafeInsetRight());
+                bottom = Math.max(bottom, cutout.getSafeInsetBottom());
+            }
+        }
+
+        cachedSafeAreaInsets = new int[]{left, top, right, bottom};
+    }
+
+    /**
+     * This method is called by SDL using JNI. Returns immediately from the
+     * cache populated by the WindowInsets listener above rather than hopping
+     * to the UI thread and blocking, unlike showSelectList() below -- that
+     * method needs the UI thread to build and show a dialog, this one only
+     * needs a value that is already sitting there.
+     * @return {left, top, right, bottom} safe-area insets in px; all zero if
+     *         no WindowInsets have been dispatched yet, or on API < 21
+     */
+    public static int[] getSafeAreaInsets() {
+        return cachedSafeAreaInsets;
     }
 
     // Select-list dialog
