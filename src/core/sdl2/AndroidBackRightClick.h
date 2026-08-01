@@ -8,7 +8,11 @@
 // to TVPBackRightClickPendingState below and to TVPPostBackRightClick()).
 // Window state (last touch position, inner size, the native instance to
 // post events to) is taken as parameters rather than reaching into
-// TVPWindowWindow, so this file has no dependency back on that class.
+// TVPWindowWindow, so this file has no dependency back on that class. A
+// plain function over a callback into TVPWindowWindow: every value it
+// needs is read once at the call site before any of the clamping or
+// event-posting logic runs, so there is no point mid-call where calling
+// back into TVPWindowWindow would do anything a parameter couldn't.
 #pragma once
 
 #ifdef __ANDROID__

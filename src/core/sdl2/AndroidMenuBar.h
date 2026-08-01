@@ -8,6 +8,11 @@
 // query that geometry is based on. Window geometry (renderer, the letterbox
 // destRect's top/left) is taken as parameters rather than reaching into
 // TVPWindowWindow, so this file has no dependency back on that class.
+// Backed by its own .cpp (a sources.txt entry) rather than kept
+// header-only like AndroidJNIStaticMethod.h: the rect/draw logic here is
+// far larger, and TVPGetCachedSafeAreaInsets's cache needs function-local
+// statics, which a header-only file would duplicate per translation unit
+// instead of sharing one instance.
 #pragma once
 
 #ifdef __ANDROID__
