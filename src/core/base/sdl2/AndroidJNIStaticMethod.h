@@ -1,6 +1,12 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright (c) Kirikiri SDL2 Developers */
 
+// Kept as its own header-only, Android-only file rather than folded into
+// SystemImpl.cpp or SDLApplication.cpp (its two callers): a .cpp here would
+// need an entry in sources.txt, which is upstream-tracked and so a needless
+// future merge-conflict point for code with no upstream counterpart; and
+// hosting the class in either caller's file would couple that file to the
+// other for no reason beyond serving it.
 #pragma once
 
 #ifdef __ANDROID__
