@@ -547,6 +547,17 @@ protected:
 	// that started on the game must not be reinterpreted as a bar tap if
 	// it happens to end up over the bar.
 	bool menuBarPressStarted = false;
+	// Set when AC_BACK (translated to a synthesized right click, see
+	// window_receive_event_input()'s SDL_KEYDOWN case) arrives while the
+	// left button is still down (an in-progress touch drag): KAG reads the
+	// left-button state via SDL_GetMouseState() directly, so synthesizing
+	// the right click immediately would present as left+right held at
+	// once, which KAG's convention reads as "start auto mode" rather than
+	// opening the menu. Deferred until the left button actually releases
+	// (see the SDL_MOUSEBUTTONUP case); a second AC_BACK arriving while
+	// already pending is coalesced into the same one pending click rather
+	// than queuing a second.
+	bool pendingBackRightClick = false;
 #endif
 	bool isBeingDeleted = false;
 	bool cursorTemporaryHidden = false;
@@ -753,6 +764,10 @@ public:
 	bool GetMenuBarRect(SDL_Rect &out) const;
 	void DrawMenuBar(const SDL_Rect &bar) const;
 	static void RequestMenuBarRedrawAll();
+	// AC_BACK-to-right-click synthesis; see window_receive_event_input()'s
+	// SDL_KEYDOWN and SDL_MOUSEBUTTONUP cases and pendingBackRightClick's
+	// doc comment above.
+	void PostBackRightClick(tjs_uint32 s);
 #endif
 };
 
@@ -2944,6 +2959,47 @@ void TVPWindowWindow::window_receive_event(SDL_Event event)
 	}
 }
 
+#ifdef __ANDROID__
+void TVPWindowWindow::PostBackRightClick(tjs_uint32 s)
+{
+	// lastMouseX/Y are last touch position translated into draw-area
+	// (inner-resolution) coordinates; a touch that landed in the
+	// letterbox black band translates to a coordinate outside
+	// [0, innerWidth)x[0, innerHeight) (TranslateWindowToDrawArea does not
+	// clamp), which the game's input layer -- sized to the inner
+	// resolution -- never hit-tests against, silently swallowing the
+	// synthesized click. Clamp a local copy only: lastMouseX/Y themselves
+	// must keep reflecting the real last-known pointer position for other
+	// callers (e.g. GetCursorPos()'s no-focus fallback), not the
+	// letterbox-band value force-fit into the game area for this one
+	// right-click synthesis.
+	int x = this->lastMouseX;
+	int y = this->lastMouseY;
+	int innerWidth = this->GetInnerWidth();
+	int innerHeight = this->GetInnerHeight();
+	if (innerWidth > 0)
+	{
+		if (x < 0) x = 0;
+		else if (x > innerWidth - 1) x = innerWidth - 1;
+	}
+	if (innerHeight > 0)
+	{
+		if (y < 0) y = 0;
+		else if (y > innerHeight - 1) y = innerHeight - 1;
+	}
+
+	// Real single-touch releases go MouseMove -> Click -> MouseUp (see the
+	// SDL_MOUSEBUTTONUP case in window_receive_event_input() below), not
+	// Down -> Up -> Click: tTVPOnClickInputEvent's PrimaryClick only fires
+	// while still holding the button's CaptureOwner, i.e. before the
+	// matching Up runs. Ordering the synthesized press the same way (here:
+	// Down -> Click -> Up) is required for the same reason, not just for
+	// consistency with real presses.
+	TVPPostInputEvent(new tTVPOnMouseDownInputEvent(this->TJSNativeInstance, x, y, tTVPMouseButton::mbRight, s));
+	TVPPostInputEvent(new tTVPOnClickInputEvent(this->TJSNativeInstance, x, y));
+	TVPPostInputEvent(new tTVPOnMouseUpInputEvent(this->TJSNativeInstance, x, y, tTVPMouseButton::mbRight, s));
+}
+#endif
 bool TVPWindowWindow::window_receive_event_input(SDL_Event event)
 {
 	if (this->isBeingDeleted)
@@ -2980,6 +3036,22 @@ bool TVPWindowWindow::window_receive_event_input(SDL_Event event)
 				case SDL_MOUSEBUTTONUP:
 				{
 #ifdef __ANDROID__
+					if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT &&
+						this->pendingBackRightClick)
+					{
+						// Flush unconditionally, ahead of the menu-bar
+						// consumption check below: this same UP may still
+						// get swallowed there (or fall through to the
+						// generic game-input path further down) depending on
+						// where its matching DOWN landed, and the deferred
+						// click must fire exactly once regardless of which
+						// path this particular event takes -- gating it on
+						// the outcome of the bar/generic branching below
+						// would leave it stuck pending whenever the bar
+						// consumes the UP.
+						this->pendingBackRightClick = false;
+						this->PostBackRightClick(s);
+					}
 					if (event.type == SDL_MOUSEBUTTONDOWN)
 					{
 						// A DOWN always starts a fresh press, so this can never
@@ -2989,6 +3061,17 @@ bool TVPWindowWindow::window_receive_event_input(SDL_Event event)
 						// was false, such as during a blocking showSelectList
 						// dialog opened from a previous bar tap).
 						this->menuBarPressStarted = false;
+						if (event.button.button == SDL_BUTTON_LEFT)
+						{
+							// Same hazard as menuBarPressStarted above, same fix:
+							// without this, a pending back-click whose flushing
+							// UP this window never saw (e.g. lost to a
+							// background transition while the drag that set it
+							// was still in progress) would otherwise survive to
+							// fire as a phantom right click on this unrelated
+							// press's eventual UP.
+							this->pendingBackRightClick = false;
+						}
 					}
 					if (event.type == SDL_MOUSEBUTTONUP && this->menuBarPressStarted)
 					{
@@ -3153,9 +3236,24 @@ bool TVPWindowWindow::window_receive_event_input(SDL_Event event)
 					{
 						if (!event.key.repeat)
 						{
-							TVPPostInputEvent(new tTVPOnMouseDownInputEvent(this->TJSNativeInstance, this->lastMouseX, this->lastMouseY, tTVPMouseButton::mbRight, s));
-							TVPPostInputEvent(new tTVPOnMouseUpInputEvent(this->TJSNativeInstance, this->lastMouseX, this->lastMouseY, tTVPMouseButton::mbRight, s));
-							TVPPostInputEvent(new tTVPOnClickInputEvent(this->TJSNativeInstance, this->lastMouseX, this->lastMouseY));
+							// KAG reads the left-button state via
+							// SDL_GetMouseState() directly (see
+							// TVPGetKeyMouseAsyncState() above), not through
+							// posted events; synthesizing the right click
+							// while a touch drag still holds the left button
+							// down would present as left+right held at once,
+							// which KAG's convention reads as "start auto
+							// mode" instead of opening the menu. Defer to the
+							// matching SDL_MOUSEBUTTONUP case below instead
+							// of posting immediately.
+							if (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON(SDL_BUTTON_LEFT))
+							{
+								this->pendingBackRightClick = true;
+							}
+							else
+							{
+								this->PostBackRightClick(s);
+							}
 						}
 						return true;
 					}
