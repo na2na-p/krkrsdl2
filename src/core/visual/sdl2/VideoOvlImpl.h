@@ -114,6 +114,12 @@ class tTJSNI_VideoOverlay : public tTJSNI_BaseVideoOverlay
 	// leaves PlmAudioNeedsEngine set) if no engine exists yet -- called
 	// once from Play() and then retried from PlmTick() until it succeeds.
 	bool PlmTryCreateAudioVoice();
+
+	// Releases the audio voice, render texture, RGB buffer and decoder, and
+	// resets the associated flags. Shared by Close() and Shutdown(), which
+	// differ only in whether they also fire onStatusChanged / update the
+	// registry (see each caller for that difference).
+	void ReleasePlmResources();
 #endif
 
 public:

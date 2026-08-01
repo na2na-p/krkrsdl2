@@ -47,6 +47,7 @@
 
 #ifdef __ANDROID__
 #include <jni.h>
+#include "AndroidJNIStaticMethod.h"
 #endif
 
 //---------------------------------------------------------------------------
@@ -143,30 +144,14 @@ static constexpr int TVPSelectListMaxItems = 16;
 static bool TVPShowSelectListViaJNI(const std::string & title_utf8,
 	const std::string item_utf8[], tjs_int count, tjs_int & result)
 {
-	JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
-	if (!env) return false;
-
-	// SDL_AndroidGetActivity() calls CallStaticObjectMethod internally and
-	// hands back a fresh local ref each time (see SDL_android.c); this
-	// thread stays attached for the process lifetime rather than returning
-	// to the JVM between calls, so the ref must be deleted explicitly or it
-	// never gets reclaimed.
-	jobject activity = (jobject)SDL_AndroidGetActivity();
-	if (!activity) return false;
-
-	jclass activityClass = env->GetObjectClass(activity);
-	env->DeleteLocalRef(activity);
-	if (!activityClass) return false;
+	TVPJNIActivityMethodResolver resolver;
+	if (!resolver.IsValid()) return false;
+	JNIEnv *env = resolver.GetEnv();
 
 	bool ok = false;
 
-	jmethodID mid = env->GetStaticMethodID(activityClass, "showSelectList",
+	jmethodID mid = resolver.GetStaticMethod("showSelectList",
 		"(Ljava/lang/String;[Ljava/lang/String;)I");
-	if (env->ExceptionCheck())
-	{
-		env->ExceptionClear();
-		mid = nullptr;
-	}
 
 	if (mid)
 	{
@@ -187,7 +172,7 @@ static bool TVPShowSelectListViaJNI(const std::string & title_utf8,
 			env->DeleteLocalRef(jitem);
 		}
 
-		jint hit = env->CallStaticIntMethod(activityClass, mid, jtitle, jitems);
+		jint hit = env->CallStaticIntMethod(resolver.GetActivityClass(), mid, jtitle, jitems);
 		if (env->ExceptionCheck())
 		{
 			env->ExceptionClear();
@@ -202,7 +187,6 @@ static bool TVPShowSelectListViaJNI(const std::string & title_utf8,
 		env->DeleteLocalRef(jitems);
 	}
 
-	env->DeleteLocalRef(activityClass);
 	return ok;
 }
 #endif

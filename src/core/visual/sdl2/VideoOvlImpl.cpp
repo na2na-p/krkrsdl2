@@ -370,29 +370,9 @@ void tTJSNI_VideoOverlay::Open(const ttstr &_name)
 #endif
 }
 //---------------------------------------------------------------------------
-void tTJSNI_VideoOverlay::Close()
+#ifdef __ANDROID__
+void tTJSNI_VideoOverlay::ReleasePlmResources()
 {
-#if defined(_WIN32) && defined(KRKRSDL2_USE_WIN32_EVENT_QUEUE) && defined(KRKRSDL2_ENABLE_VIDEOOVERLAY)
-	// close
-	// release VideoOverlay object
-	if(VideoOverlay)
-	{
-		VideoOverlay->Release(), VideoOverlay = NULL;
-		::SetFocus(Window->GetWindowHandle());
-	}
-	if(LocalTempStorageHolder)
-		delete LocalTempStorageHolder, LocalTempStorageHolder = NULL;
-	ClearWndProcMessages();
-	SetStatus(tTVPVideoOverlayStatus::Unload);
-
-	if( Bitmap[0] )
-		delete Bitmap[0];
-	if( Bitmap[1] )
-		delete Bitmap[1];
-
-	Bitmap[0] = Bitmap[1] = NULL;
-	BmpBits[0] = BmpBits[1] = NULL;
-#elif defined(__ANDROID__)
 	if(PlmAudioVoice)
 	{
 		// Only touch the voice while the shared engine is still alive.
@@ -431,6 +411,33 @@ void tTJSNI_VideoOverlay::Close()
 	}
 	PlmPlaying = false;
 	PlmFrameDirty = false;
+}
+#endif
+//---------------------------------------------------------------------------
+void tTJSNI_VideoOverlay::Close()
+{
+#if defined(_WIN32) && defined(KRKRSDL2_USE_WIN32_EVENT_QUEUE) && defined(KRKRSDL2_ENABLE_VIDEOOVERLAY)
+	// close
+	// release VideoOverlay object
+	if(VideoOverlay)
+	{
+		VideoOverlay->Release(), VideoOverlay = NULL;
+		::SetFocus(Window->GetWindowHandle());
+	}
+	if(LocalTempStorageHolder)
+		delete LocalTempStorageHolder, LocalTempStorageHolder = NULL;
+	ClearWndProcMessages();
+	SetStatus(tTVPVideoOverlayStatus::Unload);
+
+	if( Bitmap[0] )
+		delete Bitmap[0];
+	if( Bitmap[1] )
+		delete Bitmap[1];
+
+	Bitmap[0] = Bitmap[1] = NULL;
+	BmpBits[0] = BmpBits[1] = NULL;
+#elif defined(__ANDROID__)
+	ReleasePlmResources();
 
 	TVPRemoveVideoOverlay(this);
 
@@ -463,34 +470,7 @@ void tTJSNI_VideoOverlay::Shutdown()
 	// contract above, must not fire onStatusChanged -- so this releases the
 	// same resources as Close() but skips SetStatus() and the registry
 	// removal.
-	if(PlmAudioVoice)
-	{
-		// see Close() for why this checks the engine is still alive, and for
-		// why Flush needs no accompanying free
-		if(TVPGetSharedFAudioEngine())
-		{
-			FAudioSourceVoice_Stop(PlmAudioVoice, 0, FAUDIO_COMMIT_NOW);
-			FAudioSourceVoice_FlushSourceBuffers(PlmAudioVoice);
-			FAudioVoice_DestroyVoice(PlmAudioVoice);
-		}
-		PlmAudioVoice = NULL;
-	}
-	PlmAudioNeedsEngine = false;
-	PlmAudioRingNext = 0;
-	if(PlmTexture)
-	{
-		SDL_DestroyTexture(PlmTexture);
-		PlmTexture = NULL;
-	}
-	delete [] PlmRgbBuffer;
-	PlmRgbBuffer = NULL;
-	if(PlmDecoder)
-	{
-		plm_destroy(static_cast<plm_t *>(PlmDecoder));
-		PlmDecoder = NULL;
-	}
-	PlmPlaying = false;
-	PlmFrameDirty = false;
+	ReleasePlmResources();
 #endif
 }
 //---------------------------------------------------------------------------
