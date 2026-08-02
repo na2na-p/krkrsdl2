@@ -35,9 +35,11 @@
 extern bool TVPPlmTickAll();
 extern void TVPPlmRenderAll(SDL_Renderer *renderer, const SDL_Rect &destRect,
 	int innerWidth, int innerHeight);
-// For the safe-area-insets JNI query used by GetMenuBarRect() below.
-#include <jni.h>
-#include "AndroidJNIStaticMethod.h"
+// Menu bar rect/draw/safe-area-cache and AC_BACK-to-right-click synthesis
+// live in these fork-only files; see their headers for why they take
+// window geometry as parameters instead of depending on TVPWindowWindow.
+#include "AndroidMenuBar.h"
+#include "AndroidBackRightClick.h"
 #endif
 #ifdef _WIN32
 #include <shellapi.h>
@@ -558,7 +560,7 @@ protected:
 	// (see the SDL_MOUSEBUTTONUP case); a second AC_BACK arriving while
 	// already pending is coalesced into the same one pending click rather
 	// than queuing a second.
-	bool pendingBackRightClick = false;
+	TVPBackRightClickPendingState pendingBackRightClick;
 #endif
 	bool isBeingDeleted = false;
 	bool cursorTemporaryHidden = false;
@@ -1751,209 +1753,14 @@ void TVPWindowWindow::Show()
 {
 }
 #ifdef __ANDROID__
-namespace
-{
-	// left/top/right/bottom safe-area insets in px (display cutout ∪ system
-	// bars), as reported by KirikiriSDL2Activity.getSafeAreaInsets().
-	struct TVPSafeAreaInsets { int left = 0, top = 0, right = 0, bottom = 0; };
-
-	// Resolves and calls Activity.getSafeAreaInsets() via JNI, using the
-	// shared TVPJNIActivityMethodResolver (AndroidJNIStaticMethod.h) for
-	// env/Activity/class resolution and fail-closed method lookup. Stays a
-	// free function local to this file rather than exposed via
-	// SystemImpl.h: it returns an int[4] rather than blocking on a dialog
-	// result, and is only ever called from the render path below
-	// (TVPGetCachedSafeAreaInsets), not from input handling.
-	bool TVPFetchSafeAreaInsetsViaJNI(TVPSafeAreaInsets &out)
-	{
-		TVPJNIActivityMethodResolver resolver;
-		if (!resolver.IsValid()) return false;
-		JNIEnv *env = resolver.GetEnv();
-
-		bool ok = false;
-		jmethodID mid = resolver.GetStaticMethod("getSafeAreaInsets", "()[I");
-
-		if (mid)
-		{
-			jintArray insets = (jintArray)env->CallStaticObjectMethod(resolver.GetActivityClass(), mid);
-			if (env->ExceptionCheck())
-			{
-				env->ExceptionClear();
-			}
-			else if (insets && env->GetArrayLength(insets) >= 4)
-			{
-				jint buf[4];
-				env->GetIntArrayRegion(insets, 0, 4, buf);
-				out.left = buf[0];
-				out.top = buf[1];
-				out.right = buf[2];
-				out.bottom = buf[3];
-				ok = true;
-			}
-			if (insets) env->DeleteLocalRef(insets);
-		}
-
-		return ok;
-	}
-
-	// Caches the JNI result across GetMenuBarRect() calls, which run once
-	// per rendered frame while the bar is visible -- an unconditional JNI
-	// round trip there would mean a JNI call every frame. The insets only
-	// change on rotation or a cutout-mode change, and both of those already
-	// change the letterbox geometry GetMenuBarRect() computes from (output
-	// size, or the destRect letterbox offsets), so keying the cache on that
-	// same geometry re-fetches exactly when needed without a dedicated
-	// Java-to-native invalidation callback.
-	const TVPSafeAreaInsets &TVPGetCachedSafeAreaInsets(
-		int output_w, int output_h, tjs_int destTop, tjs_int destLeft)
-	{
-		static TVPSafeAreaInsets cached;
-		static bool cachedValid = false;
-		static int cachedOutputW = -1, cachedOutputH = -1;
-		static tjs_int cachedDestTop = -1, cachedDestLeft = -1;
-
-		if (!cachedValid || cachedOutputW != output_w || cachedOutputH != output_h ||
-			cachedDestTop != destTop || cachedDestLeft != destLeft)
-		{
-			TVPSafeAreaInsets fetched;
-			if (TVPFetchSafeAreaInsetsViaJNI(fetched))
-			{
-				cached = fetched;
-			}
-			else if (!cachedValid)
-			{
-				cached = TVPSafeAreaInsets();
-			}
-			cachedOutputW = output_w;
-			cachedOutputH = output_h;
-			cachedDestTop = destTop;
-			cachedDestLeft = destLeft;
-			cachedValid = true;
-		}
-		return cached;
-	}
-}
 bool TVPWindowWindow::GetMenuBarRect(SDL_Rect &out) const
 {
-	if (!this->renderer) return false;
-	int output_w = 0, output_h = 0;
-	SDL_GetRendererOutputSize(this->renderer, &output_w, &output_h);
-	if (output_w <= 0 || output_h <= 0) return false;
-
-	// Thickness follows the letterbox band so the bar never overlaps the
-	// rendered game frame, but is capped at 5% of the screen (floor 32px)
-	// so it stays usable when the game fills the screen with no bars.
-	auto cap = [](int screen_dim) {
-		int c = screen_dim * 5 / 100;
-		return c < 32 ? 32 : c;
-	};
-
-	// Fits the bar's thickness inside whatever band space is left once the
-	// leading-edge safe-area inset is subtracted from the letterbox band
-	// (bandAvailable), so that after the inset offset is applied to out.x/
-	// out.y below, the bar's trailing edge still lands at or before the
-	// band's own edge -- out.x + out.w <= destLeft for the landscape case,
-	// out.y + out.h <= destTop for the portrait case -- preserving "never
-	// overlaps the rendered game frame" from the comment above. When the
-	// band itself is narrower than the cap floor (32px) -- the letterbox is
-	// thinner than the safe-area inset, a rare device/orientation
-	// combination -- honoring both "start past the inset" and "end within
-	// the band" is impossible, so this keeps the 32px floor instead and
-	// accepts a small overlap onto the game frame: a bar the user can still
-	// find and tap outweighs one that stays clear of the game area but
-	// sits fully under an obscuring cutout.
-	auto fitWithinBand = [](int desired, int bandAvailable) {
-		if (bandAvailable >= 32) return desired < bandAvailable ? desired : bandAvailable;
-		return 32;
-	};
-
-	tjs_int destTop = this->LastSentDrawDeviceDestRect.top;
-	tjs_int destLeft = this->LastSentDrawDeviceDestRect.left;
-
-	const TVPSafeAreaInsets &insets =
-		TVPGetCachedSafeAreaInsets(output_w, output_h, destTop, destLeft);
-
-	if (destTop > 0)
-	{
-		// Portrait letterbox (top/bottom black bars): bar sits at the screen
-		// top, shifted below any cutout/status-bar inset so it isn't itself
-		// clipped by the cutout; thickness is fit to what remains of the
-		// band below that inset (see fitWithinBand above), so the bar still
-		// never overlaps the rendered game frame except in that helper's
-		// documented rare-device fallback.
-		int h = fitWithinBand(cap(output_h), destTop - insets.top);
-		out.x = 0;
-		out.y = insets.top;
-		out.w = output_w;
-		out.h = h;
-	}
-	else if (destLeft > 0)
-	{
-		// Landscape letterbox (left/right black bars): bar sits at the
-		// screen left edge -- not the right edge, so it stops colliding with
-		// the right-edge back-gesture swipe area on right-handed grips --
-		// shifted right past any left-edge cutout inset; width is fit to
-		// what remains of the band past that inset (see fitWithinBand
-		// above), with the same rare-device fallback.
-		int w = fitWithinBand(cap(output_w), destLeft - insets.left);
-		out.x = insets.left;
-		out.y = 0;
-		out.w = w;
-		out.h = output_h;
-	}
-	else
-	{
-		// No letterbox: fall back to overlaying the screen top. There is no
-		// black band to avoid overlapping here regardless of insets -- the
-		// game already fills the screen, so this branch has always drawn
-		// over it -- so this only clamps against running off the bottom
-		// edge of the screen, not against a no-overlap invariant that does
-		// not apply in this branch.
-		int h = cap(output_h);
-		if (insets.top + h > output_h) h = output_h - insets.top;
-		if (h < 0) h = 0;
-		out.x = 0;
-		out.y = insets.top;
-		out.w = output_w;
-		out.h = h;
-	}
-	return true;
+	return TVPGetMenuBarRect(this->renderer, this->LastSentDrawDeviceDestRect.top,
+		this->LastSentDrawDeviceDestRect.left, out);
 }
 void TVPWindowWindow::DrawMenuBar(const SDL_Rect &bar) const
 {
-	Uint8 pr, pg, pb, pa;
-	SDL_GetRenderDrawColor(this->renderer, &pr, &pg, &pb, &pa);
-
-	SDL_SetRenderDrawColor(this->renderer, 0x1E, 0x1E, 0x1E, 0xFF);
-	SDL_RenderFillRect(this->renderer, &bar);
-
-	// Hamburger icon (3 stacked bars). Computing the offset from the bar's
-	// short axis and applying it to both x and y works for both
-	// orientations without branching: it centers the icon on the short
-	// axis and keeps it near the bar's leading edge on the long axis.
-	int shortSide = bar.w < bar.h ? bar.w : bar.h;
-	int iconSize = shortSide * 3 / 5;
-	if (iconSize < 12) iconSize = shortSide < 12 ? shortSide : 12;
-	if (iconSize > shortSide) iconSize = shortSide;
-	int margin = (shortSide - iconSize) / 2;
-
-	int lineThickness = iconSize / 6;
-	if (lineThickness < 2) lineThickness = 2;
-	int gap = (iconSize - lineThickness * 3) / 2;
-	if (gap < 1) gap = 1;
-
-	SDL_SetRenderDrawColor(this->renderer, 0xC8, 0xC8, 0xC8, 0xFF);
-	for (int i = 0; i < 3; i++)
-	{
-		SDL_Rect line;
-		line.x = bar.x + margin;
-		line.y = bar.y + margin + i * (lineThickness + gap);
-		line.w = iconSize;
-		line.h = lineThickness;
-		SDL_RenderFillRect(this->renderer, &line);
-	}
-
-	SDL_SetRenderDrawColor(this->renderer, pr, pg, pb, pa);
+	TVPDrawMenuBar(this->renderer, bar);
 }
 void TVPWindowWindow::RequestMenuBarRedrawAll()
 {
@@ -2950,42 +2757,8 @@ void TVPWindowWindow::window_receive_event(SDL_Event event)
 #ifdef __ANDROID__
 void TVPWindowWindow::PostBackRightClick(tjs_uint32 s)
 {
-	// lastMouseX/Y are last touch position translated into draw-area
-	// (inner-resolution) coordinates; a touch that landed in the
-	// letterbox black band translates to a coordinate outside
-	// [0, innerWidth)x[0, innerHeight) (TranslateWindowToDrawArea does not
-	// clamp), which the game's input layer -- sized to the inner
-	// resolution -- never hit-tests against, silently swallowing the
-	// synthesized click. Clamp a local copy only: lastMouseX/Y themselves
-	// must keep reflecting the real last-known pointer position for other
-	// callers (e.g. GetCursorPos()'s no-focus fallback), not the
-	// letterbox-band value force-fit into the game area for this one
-	// right-click synthesis.
-	int x = this->lastMouseX;
-	int y = this->lastMouseY;
-	int innerWidth = this->GetInnerWidth();
-	int innerHeight = this->GetInnerHeight();
-	if (innerWidth > 0)
-	{
-		if (x < 0) x = 0;
-		else if (x > innerWidth - 1) x = innerWidth - 1;
-	}
-	if (innerHeight > 0)
-	{
-		if (y < 0) y = 0;
-		else if (y > innerHeight - 1) y = innerHeight - 1;
-	}
-
-	// Real single-touch releases go MouseMove -> Click -> MouseUp (see the
-	// SDL_MOUSEBUTTONUP case in window_receive_event_input() below), not
-	// Down -> Up -> Click: tTVPOnClickInputEvent's PrimaryClick only fires
-	// while still holding the button's CaptureOwner, i.e. before the
-	// matching Up runs. Ordering the synthesized press the same way (here:
-	// Down -> Click -> Up) is required for the same reason, not just for
-	// consistency with real presses.
-	TVPPostInputEvent(new tTVPOnMouseDownInputEvent(this->TJSNativeInstance, x, y, tTVPMouseButton::mbRight, s));
-	TVPPostInputEvent(new tTVPOnClickInputEvent(this->TJSNativeInstance, x, y));
-	TVPPostInputEvent(new tTVPOnMouseUpInputEvent(this->TJSNativeInstance, x, y, tTVPMouseButton::mbRight, s));
+	TVPPostBackRightClick(this->TJSNativeInstance, this->lastMouseX, this->lastMouseY,
+		this->GetInnerWidth(), this->GetInnerHeight(), s);
 }
 #endif
 bool TVPWindowWindow::window_receive_event_input(SDL_Event event)
@@ -3025,7 +2798,7 @@ bool TVPWindowWindow::window_receive_event_input(SDL_Event event)
 				{
 #ifdef __ANDROID__
 					if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT &&
-						this->pendingBackRightClick)
+						this->pendingBackRightClick.IsPending())
 					{
 						// Flush unconditionally, ahead of the menu-bar
 						// consumption check below: this same UP may still
@@ -3037,7 +2810,7 @@ bool TVPWindowWindow::window_receive_event_input(SDL_Event event)
 						// the outcome of the bar/generic branching below
 						// would leave it stuck pending whenever the bar
 						// consumes the UP.
-						this->pendingBackRightClick = false;
+						this->pendingBackRightClick.Reset();
 						this->PostBackRightClick(s);
 					}
 					if (event.type == SDL_MOUSEBUTTONDOWN)
@@ -3058,7 +2831,7 @@ bool TVPWindowWindow::window_receive_event_input(SDL_Event event)
 							// was still in progress) would otherwise survive to
 							// fire as a phantom right click on this unrelated
 							// press's eventual UP.
-							this->pendingBackRightClick = false;
+							this->pendingBackRightClick.Reset();
 						}
 					}
 					if (event.type == SDL_MOUSEBUTTONUP && this->menuBarPressStarted)
@@ -3236,7 +3009,7 @@ bool TVPWindowWindow::window_receive_event_input(SDL_Event event)
 							// of posting immediately.
 							if (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON(SDL_BUTTON_LEFT))
 							{
-								this->pendingBackRightClick = true;
+								this->pendingBackRightClick.Arm();
 							}
 							else
 							{
