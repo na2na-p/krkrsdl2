@@ -359,7 +359,7 @@ public:
 		else
 		{
 			AudioVolumeValue = vol;
-		} 
+		}
 
 		SetVolumeToFAudio();
 	}
