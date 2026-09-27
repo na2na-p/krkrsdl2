@@ -597,6 +597,9 @@ protected:
 #ifdef _WIN32
 	tObjectList<tTVPMessageReceiverRecord> WindowMessageReceivers;
 #endif
+	void InitializeSDLWindow();
+	void UnlinkFromWindowList();
+	void ReleaseSDLResources();
 
 public:
 	TVPWindowWindow(tTJSNI_Window *w);
@@ -777,11 +780,23 @@ public:
 TVPWindowWindow::TVPWindowWindow(tTJSNI_Window *w)
 {
 	this->window = nullptr;
+	// Nulled before anything fallible runs so that ReleaseSDLResources(),
+	// called if a later step throws, never reads an uninitialized member.
+	// openGlScreen is not released there; it is only initialized early.
+	this->texture = nullptr;
+	this->renderer = nullptr;
+	this->surface = nullptr;
+	this->bitmapCompletion = nullptr;
+#ifdef KRKRZ_ENABLE_CANVAS
+	this->context = nullptr;
+	this->openGlScreen = nullptr;
+#endif
 	this->ResetImeMode();
 	this->fileDropArray = nullptr;
 	this->fileDropArrayCount = 0;
 	this->lastMouseX = 0;
 	this->lastMouseY = 0;
+	TVPWindowWindow *previousCurrentWindow = _currentWindowWindow;
 	this->_nextWindow = nullptr;
 	this->_prevWindow = _lastWindowWindow;
 	_lastWindowWindow = this;
@@ -795,6 +810,31 @@ TVPWindowWindow::TVPWindowWindow(tTJSNI_Window *w)
 	}
 	this->TJSNativeInstance = w;
 
+	// The destructor does not run when a constructor throws, but the
+	// memory is still freed, so without this the window list and
+	// _currentWindowWindow would keep pointing at the freed object.
+	// _currentWindowWindow is restored to its previous value rather than
+	// recomputed as in the destructor, because it may legitimately be
+	// nullptr while windows exist (see the hidden window case in
+	// SetVisible()).
+	try
+	{
+		this->InitializeSDLWindow();
+	}
+	catch (...)
+	{
+		this->UnlinkFromWindowList();
+		if (_currentWindowWindow == this)
+		{
+			_currentWindowWindow = previousCurrentWindow;
+		}
+		this->ReleaseSDLResources();
+		throw;
+	}
+}
+
+void TVPWindowWindow::InitializeSDLWindow()
+{
 	if (!SDL_WasInit(SDL_INIT_VIDEO))
 	{
 		if (SDL_Init(SDL_INIT_VIDEO) < 0)
@@ -871,7 +911,6 @@ TVPWindowWindow::TVPWindowWindow(tTJSNI_Window *w)
 	emscripten_enter_soft_fullscreen("#canvas", &strategy);
 #endif
 #ifdef KRKRZ_ENABLE_CANVAS
-	this->context = nullptr;
 	if (!TVPIsEnableDrawDevice())
 	{
 		this->context = SDL_GL_CreateContext(this->window);
@@ -882,12 +921,6 @@ TVPWindowWindow::TVPWindowWindow(tTJSNI_Window *w)
 		SDL_GL_MakeCurrent(this->window, this->context);
 	}
 #endif
-	this->renderer = nullptr;
-	this->bitmapCompletion = nullptr;
-#ifdef KRKRZ_ENABLE_CANVAS
-	this->openGlScreen = nullptr;
-#endif
-	this->surface = nullptr;
 #ifdef KRKRZ_ENABLE_CANVAS
 	if (TVPIsEnableDrawDevice())
 #endif
@@ -920,7 +953,6 @@ TVPWindowWindow::TVPWindowWindow(tTJSNI_Window *w)
 		{
 			TVPThrowExceptionMessage(TJS_W("Cannot get surface or renderer from SDL window"));
 		}
-		this->texture = nullptr;
 		if (this->renderer)
 		{
 			SDL_SetRenderDrawColor(this->renderer, 0x00, 0x00, 0x00, 0xFF);
@@ -932,7 +964,7 @@ TVPWindowWindow::TVPWindowWindow(tTJSNI_Window *w)
 	Application->AddWindow(this);
 }
 
-TVPWindowWindow::~TVPWindowWindow()
+void TVPWindowWindow::UnlinkFromWindowList()
 {
 	if (_lastWindowWindow == this)
 	{
@@ -946,10 +978,10 @@ TVPWindowWindow::~TVPWindowWindow()
 	{
 		this->_prevWindow->_nextWindow = this->_nextWindow;
 	}
-	if (_currentWindowWindow == this)
-	{
-		_currentWindowWindow = _lastWindowWindow;
-	}
+}
+
+void TVPWindowWindow::ReleaseSDLResources()
+{
 	if (this->bitmapCompletion)
 	{
 		delete this->bitmapCompletion;
@@ -979,6 +1011,16 @@ TVPWindowWindow::~TVPWindowWindow()
 		SDL_DestroyWindow(this->window);
 		this->window = nullptr;
 	}
+}
+
+TVPWindowWindow::~TVPWindowWindow()
+{
+	this->UnlinkFromWindowList();
+	if (_currentWindowWindow == this)
+	{
+		_currentWindowWindow = _lastWindowWindow;
+	}
+	this->ReleaseSDLResources();
 
 #ifdef _WIN32
 	tjs_int count = this->WindowMessageReceivers.GetCount();
